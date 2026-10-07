@@ -37,12 +37,15 @@ namespace Arena.Gameplay
     }
 
     /// <summary>
-    /// The whole match in one place: ice movement, perimeter walls, body
-    /// contact, every spell in <see cref="GameConfig"/>, zone pressure and the
-    /// bot brain. Gameplay code feeds it an input direction each frame and
-    /// reads cooldowns / deaths back out; the fighters' transforms and
-    /// nameplates are written by the sim so HUD, camera and world bar can never
-    /// disagree.
+    /// Orchestrates one match: ice movement, perimeter walls, the fixed-step
+    /// loop and the guest snapshot view. The heavy rules live in focused
+    /// collaborators — <see cref="CombatResolver"/> (contact, damage, sweeps),
+    /// <see cref="BotBrain"/> (opponent AI), <see cref="FxSpawner"/> (spell
+    /// effects and replication) and <see cref="ZoneField"/> (zone pressure).
+    ///
+    /// Gameplay code feeds it an input direction each frame and reads
+    /// cooldowns / deaths back out; the fighters' transforms and nameplates are
+    /// written by the sim so HUD, camera and world bar can never disagree.
     ///
     /// It owns only transient spell FX — <see cref="Clear"/> wipes those when
     /// the match ends (fighter views are destroyed by the caller).
@@ -51,13 +54,9 @@ namespace Arena.Gameplay
     {
         private readonly FighterSim local;
         private readonly FighterSim foe;
-        private readonly ZoneShape zone;
+        private readonly ZoneField zone;
+        private readonly FxSpawner fx = new FxSpawner();
 
-        private readonly List<Projectile> projectiles = new List<Projectile>();
-        private readonly List<VortexHazard> vortices = new List<VortexHazard>();
-        private readonly List<RingFx> rings = new List<RingFx>();
-        private readonly List<GameObject> replicatedEffects = new List<GameObject>();
-        private GameObject fxRoot;
         private double accumulatedTime;
 
         // Guest view smoothing. The guest has no prediction: it renders what
@@ -72,17 +71,14 @@ namespace Arena.Gameplay
         public int StepsLastTick { get; private set; }
         public double PendingTime => accumulatedTime;
 
-        private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
-        private static Shader fxShader;
-
         public FighterSim Local => local;
         public FighterSim Foe => foe;
-        public ZoneShape Zone => zone;
+        public ZoneShape Zone => zone.Shape;
 
         public MatchSim(CharacterDef localDef, CharacterDef foeDef, bool foeIsBot,
             CharacterView localView, CharacterView foeView, ZoneShape zoneShape)
         {
-            zone = zoneShape;
+            zone = new ZoneField(zoneShape);
 
             local = new FighterSim
             {
@@ -135,7 +131,7 @@ namespace Arena.Gameplay
 
         private void Step(float dt, Vector3 localInputDir)
         {
-            if (foe.IsBot && !foe.Dead) TickBot(foe, dt);
+            if (foe.IsBot && !foe.Dead) BotBrain.Tick(foe, local, dt, zone, Cast);
             // Capture after casts (especially Blink): teleports are not swept attacks.
             local.PreviousPosition = local.Position;
             foe.PreviousPosition = foe.Position;
@@ -146,18 +142,18 @@ namespace Arena.Gameplay
             Integrate(local, dt);
             Integrate(foe, dt);
 
-            ResolveCharge(local, foe);
-            ResolveCharge(foe, local);
+            CombatResolver.ResolveCharge(local, foe);
+            CombatResolver.ResolveCharge(foe, local);
             if (local.HitWall) local.ChargeTimer = 0f;
             if (foe.HitWall) foe.ChargeTimer = 0f;
 
-            TickProjectiles(dt);
-            TickVortices(dt);
-            ResolveBodyContact();
+            fx.TickProjectiles(dt, local, foe);
+            fx.TickVortices(dt, local, foe);
+            CombatResolver.ResolveBodyContact(local, foe);
 
-            TickZoneDamage(local, dt);
-            TickZoneDamage(foe, dt);
-            TickRings(dt);
+            zone.ApplyDamage(local, dt);
+            zone.ApplyDamage(foe, dt);
+            fx.TickRings(dt);
             TickTimers(local, dt);
             TickTimers(foe, dt);
 
@@ -238,30 +234,6 @@ namespace Arena.Gameplay
             f.Position = p;
         }
 
-        private void ResolveBodyContact(FighterSim a, FighterSim b)
-        {
-            Vector3 delta = b.Position - a.Position;
-            delta.y = 0f;
-            float minDist = GameConfig.PlayerRadius * 2f;
-            float dist = delta.magnitude;
-            if (dist >= minDist) return;
-
-            Vector3 n = dist > 0.0001f ? delta / dist : Vector3.right;
-            float overlap = minDist - dist;
-            a.Position -= n * (overlap * 0.5f);
-            b.Position += n * (overlap * 0.5f);
-
-            float rel = Vector3.Dot(a.Velocity - b.Velocity, n);
-            if (rel > 0f)
-            {
-                float imp = rel * (1f + GameConfig.BodyRestitution) * 0.5f;
-                a.Velocity -= n * imp;
-                b.Velocity += n * imp;
-            }
-        }
-
-        private void ResolveBodyContact() => ResolveBodyContact(local, foe);
-
         // ---------------------------------------------------------------- spells
 
         /// <summary>
@@ -292,32 +264,32 @@ namespace Arena.Gameplay
 
                 case "shockwave":
                 case "earthquake":
-                    SpawnRing(caster.Position, ab.Range, caster.Def.ColorLight);
-                    TryHit(target, ab, target.Position - caster.Position, ab.Range);
+                    fx.SpawnRing(caster.Position, ab.Range, caster.Def.ColorLight);
+                    CombatResolver.TryHit(caster, target, ab, target.Position - caster.Position, ab.Range);
                     break;
 
                 case "thunder_orb":
-                    SpawnProjectile(caster, ab, fwd);
+                    fx.SpawnProjectile(caster, ab, fwd);
                     break;
 
                 case "blink":
                 {
-                    SpawnRing(caster.Position, 1.8f, caster.Def.ColorLight);
+                    fx.SpawnRing(caster.Position, 1.8f, caster.Def.ColorLight);
                     Vector3 dest = ClampToArena(caster.Position + fwd * ab.BlinkDistance);
                     caster.Position = dest;
                     if (caster.View != null)
                         caster.View.transform.position = dest;
                     caster.Invulnerable = ab.BlinkInvulnerability;
-                    SpawnRing(dest, 1.8f, caster.Def.ColorLight);
+                    fx.SpawnRing(dest, 1.8f, caster.Def.ColorLight);
                     break;
                 }
 
                 case "vortex":
-                    SpawnVortex(caster, ab);
+                    fx.SpawnVortex(caster, ab);
                     break;
 
                 default:
-                    TryHit(target, ab, target.Position - caster.Position, ab.Range);
+                    CombatResolver.TryHit(caster, target, ab, target.Position - caster.Position, ab.Range);
                     break;
             }
 
@@ -325,355 +297,15 @@ namespace Arena.Gameplay
             return true;
         }
 
-        /// <summary>Contact window for the dash: whoever the charger touches goes flying.</summary>
-        private void ResolveCharge(FighterSim caster, FighterSim target)
-        {
-            if (caster.ChargeTimer <= 0f || target.Dead) return;
-            if (!SweptContact(caster.PreviousPosition, caster.Position,
-                target.PreviousPosition, target.Position,
-                GameConfig.PlayerRadius * 2f + 0.35f, out float contact)) return;
+        /// <summary>Whether a world point falls outside the shrinking zone.</summary>
+        public bool IsOutsideZone(Vector3 p) => zone.IsOutside(p);
 
-            caster.ChargeTimer = 0f;
-            Vector3 dir = Vector3.Lerp(target.PreviousPosition, target.Position, contact) -
-                Vector3.Lerp(caster.PreviousPosition, caster.Position, contact);
-            if (dir.sqrMagnitude < 0.0001f) dir = caster.Forward;
-            ApplyHit(target, caster.ChargeAbility, dir);
-        }
-
-        private void TryHit(FighterSim target, AbilityDef ab, Vector3 dir, float range)
-        {
-            if (range <= 0f || FlatDistance(local.Position, foe.Position) <= range)
-                ApplyHit(target, ab, dir);
-        }
-
-        private void ApplyHit(FighterSim target, AbilityDef ab, Vector3 dir)
-        {
-            if (target.Dead || target.Invulnerable > 0f) return;
-
-            target.Health = Mathf.Max(0f, target.Health - ab.Damage);
-            if (dir.sqrMagnitude < 0.0001f) dir = Vector3.forward;
-            target.Velocity += dir.normalized * ab.KnockImpulse;
-            if (ab.Stun > 0f) target.Stun = Mathf.Max(target.Stun, ab.Stun);
-            target.ChargeTimer = 0f; // a clean hit cancels their own charge
-
-            if (target.View != null)
-            {
-                target.View.PlayHitFlash();
-                target.View.SetHealth(target.Health, GameConfig.MaxHealth);
-            }
-
-            if (target.Health <= 0f) target.Dead = true;
-        }
-
-        // ---------------------------------------------------------------- bot
-
-        private void TickBot(FighterSim bot, float dt)
-        {
-            if (bot.Stun > 0f)
-            {
-                bot.DesiredDir = Vector3.zero;
-                return;
-            }
-
-            Vector3 toTarget = local.Position - bot.Position;
-            toTarget.y = 0f;
-            float d = toTarget.magnitude;
-
-            bot.DecisionTimer -= dt;
-            if (bot.DecisionTimer > 0f) return;
-
-            bot.DecisionTimer = Random.Range(GameConfig.BotDecisionMin, GameConfig.BotDecisionMax);
-
-            if (IsOutsideZone(bot.Position))
-            {
-                // Safety first: run back toward the middle of the arena.
-                bot.DesiredDir = (-bot.Position).normalized;
-            }
-            else if (d > 7f)
-            {
-                bot.DesiredDir = toTarget / d;
-            }
-            else if (d <= 0.0001f)
-            {
-                bot.DesiredDir = Vector3.right;
-            }
-            else if (d < 2f)
-            {
-                // Too close — give the charge some room.
-                bot.DesiredDir = -(toTarget / d);
-            }
-            else
-            {
-                bot.StrafeSign = Random.value < 0.5f ? 1f : -1f;
-                Vector3 side = Vector3.Cross(Vector3.up, toTarget / d) * bot.StrafeSign;
-                bot.DesiredDir = ((toTarget / d) * 0.6f + side * 0.8f).normalized;
-            }
-
-            TryBotCast(bot, d, toTarget);
-        }
-
-        private void TryBotCast(FighterSim bot, float d, Vector3 toTarget)
-        {
-            for (int slot = 0; slot < 3; slot++)
-            {
-                if (bot.Cooldowns[slot] > 0f) continue;
-
-                AbilityDef ab = bot.Def.Get((AbilitySlot)slot);
-                bool inRange;
-                switch (ab.Id)
-                {
-                    case "charge":
-                        inRange = d > 2.5f && d < 13f;
-                        break;
-                    case "blink":
-                        inRange = d > 6f && d < 16f;
-                        break;
-                    default:
-                        inRange = ab.Range > 0f ? d <= ab.Range * 0.95f : d <= 12f;
-                        break;
-                }
-
-                if (!inRange) continue;
-                if (Random.value > GameConfig.BotCastChance) continue; // hold the trigger
-
-                if (toTarget.sqrMagnitude > 0.0001f)
-                    bot.Forward = toTarget.normalized;
-                Cast(bot, slot);
-                return; // one spell per decision tick
-            }
-        }
-
-        // ------------------------------------------------------------ zone / fx
-
-        public bool IsOutsideZone(Vector3 p)
-        {
-            if (zone == ZoneShape.Circle)
-            {
-                float r = GameConfig.ZoneCircleRadius;
-                return new Vector2(p.x, p.z).sqrMagnitude > r * r;
-            }
-            return Mathf.Abs(p.x) > GameConfig.ZoneHalfWidth ||
-                   Mathf.Abs(p.z) > GameConfig.ZoneHalfHeight;
-        }
-
-        private void TickZoneDamage(FighterSim f, float dt)
-        {
-            if (f.Dead || !IsOutsideZone(f.Position)) return;
-
-            f.Health = Mathf.Max(0f, f.Health - GameConfig.ZoneDamagePerSecond * dt);
-            if (f.View != null) f.View.SetHealth(f.Health, GameConfig.MaxHealth);
-            if (f.Health <= 0f) f.Dead = true;
-        }
-
-        private sealed class Projectile
-        {
-            public GameObject Go;
-            public Vector3 Velocity;
-            public AbilityDef Ab;
-            public FighterSim Owner;
-            public float Life;
-        }
-
-        private sealed class VortexHazard
-        {
-            public GameObject Go;
-            public Vector3 Centre;
-            public float Radius;
-            public float Life;
-            public float TotalLife;
-            public AbilityDef Ab;
-            public FighterSim Owner;
-        }
-
-        private sealed class RingFx
-        {
-            public GameObject Go;
-            public float T;
-            public float MaxRadius;
-        }
-
-        private void SpawnProjectile(FighterSim caster, AbilityDef ab, Vector3 dir)
-        {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            Object.Destroy(go.GetComponent<Collider>());
-            go.name = "Orb";
-            go.transform.SetParent(FxRoot.transform, false);
-            go.transform.position = caster.Position + Vector3.up * 1.1f + dir * 0.9f;
-            go.transform.localScale = Vector3.one * 0.75f;
-            OwnedMaterial.Assign(go, MakeUnlit(caster.Def.ColorLight));
-
-            projectiles.Add(new Projectile
-            {
-                Go = go,
-                Velocity = dir * GameConfig.OrbSpeed,
-                Ab = ab,
-                Owner = caster,
-                Life = 1.5f
-            });
-        }
-
-        private void TickProjectiles(float dt)
-        {
-            for (int i = projectiles.Count - 1; i >= 0; i--)
-            {
-                Projectile p = projectiles[i];
-                Vector3 start = p.Go.transform.position;
-                float travelTime = Mathf.Min(dt, Mathf.Max(0f, p.Life));
-                Vector3 end = start + p.Velocity * travelTime;
-                // Stop at the inner wall face, accounting for the orb radius.
-                float wallFraction = WallFraction(start, end, 0.375f);
-                end = Vector3.Lerp(start, end, wallFraction);
-                float targetFraction = travelTime / dt * wallFraction;
-                FighterSim target = p.Owner == local ? foe : local;
-                Vector3 targetEnd = Vector3.Lerp(target.PreviousPosition,
-                    target.Position, targetFraction);
-                if (wallFraction > 0f && !target.Dead && SweptContact(start, end,
-                    target.PreviousPosition, targetEnd,
-                    GameConfig.PlayerRadius + 0.375f, out float contact))
-                {
-                    p.Go.transform.position = Vector3.Lerp(start, end, contact);
-                    ApplyHit(target, p.Ab, p.Velocity);
-                    p.Life = 0f;
-                }
-                else
-                {
-                    p.Go.transform.position = end;
-                    p.Life -= dt;
-                    if (wallFraction < 1f) p.Life = 0f;
-                }
-
-                if (p.Life <= 0f)
-                {
-                    Object.Destroy(p.Go);
-                    projectiles.RemoveAt(i);
-                }
-            }
-        }
-
-        private void SpawnVortex(FighterSim caster, AbilityDef ab)
-        {
-            Vector3 centre = caster.Position;
-            var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            Object.Destroy(go.GetComponent<Collider>());
-            go.name = "Vortex";
-            go.transform.SetParent(FxRoot.transform, false);
-            go.transform.position = centre + Vector3.up * 0.06f;
-            go.transform.localScale = new Vector3(ab.HazardRadius * 2f, 0.05f, ab.HazardRadius * 2f);
-            OwnedMaterial.Assign(go, MakeUnlit(caster.Def.Color));
-
-            vortices.Add(new VortexHazard
-            {
-                Go = go,
-                Centre = centre,
-                Radius = ab.HazardRadius,
-                Life = ab.HazardLifetime,
-                TotalLife = ab.HazardLifetime,
-                Ab = ab,
-                Owner = caster
-            });
-        }
-
-        private void TickVortices(float dt)
-        {
-            for (int i = vortices.Count - 1; i >= 0; i--)
-            {
-                VortexHazard v = vortices[i];
-                v.Life -= dt;
-
-                // Visual: the ring breathes while it charges its burst.
-                if (v.Go != null)
-                {
-                    float pulse = 1f + 0.06f * Mathf.Sin(Time.time * 14f);
-                    float s = v.Radius * 2f * pulse * Mathf.Lerp(0.55f, 1f,
-                        1f - Mathf.Clamp01(v.Life / v.TotalLife));
-                    v.Go.transform.localScale = new Vector3(s, 0.05f, s);
-                }
-
-                FighterSim target = v.Owner == local ? foe : local;
-                if (!target.Dead && target.Invulnerable <= 0f)
-                {
-                    Vector3 toCentre = v.Centre - target.Position;
-                    toCentre.y = 0f;
-                    float d = toCentre.magnitude;
-                    if (d > 0.01f && d <= v.Radius)
-                        target.Velocity += (toCentre / d) * (GameConfig.VortexPullSpeed * dt);
-                }
-
-                if (v.Life > 0f) continue;
-
-                // Burst: whoever is still inside eats the launch.
-                if (!target.Dead)
-                {
-                    Vector3 away = target.Position - v.Centre;
-                    away.y = 0f;
-                    if (away.sqrMagnitude <= v.Radius * v.Radius)
-                        ApplyHit(target, v.Ab, away.sqrMagnitude > 0.0001f ? away : Vector3.forward);
-                }
-
-                SpawnRing(v.Centre, v.Radius, v.Owner.Def.ColorLight);
-                Object.Destroy(v.Go);
-                vortices.RemoveAt(i);
-            }
-        }
-
-        private void SpawnRing(Vector3 centre, float radius, Color color)
-        {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            Object.Destroy(go.GetComponent<Collider>());
-            go.name = "RingFx";
-            go.transform.SetParent(FxRoot.transform, false);
-            go.transform.position = centre + Vector3.up * 0.05f;
-            go.transform.localScale = new Vector3(0.3f, 0.05f, 0.3f);
-            OwnedMaterial.Assign(go, MakeUnlit(color));
-
-            rings.Add(new RingFx { Go = go, MaxRadius = radius });
-        }
-
-        private void TickRings(float dt)
-        {
-            float duration = GameConfig.RingFxSeconds;
-            for (int i = rings.Count - 1; i >= 0; i--)
-            {
-                RingFx r = rings[i];
-                r.T += dt;
-                float k = Mathf.Clamp01(r.T / duration);
-                // A unit cylinder is 1 across, so diameter == 2 * radius.
-                float diameter = Mathf.Lerp(0.4f, r.MaxRadius * 2f, k);
-                if (r.Go != null)
-                    r.Go.transform.localScale = new Vector3(diameter, 0.05f, diameter);
-
-                if (r.T < duration) continue;
-                Object.Destroy(r.Go);
-                rings.RemoveAt(i);
-            }
-        }
-
-        // ---------------------------------------------------------------- utils
-
-        private GameObject FxRoot
-        {
-            get
-            {
-                if (fxRoot == null)
-                {
-                    fxRoot = new GameObject("MatchFx");
-                }
-                return fxRoot;
-            }
-        }
+        // ------------------------------------------------------------ snapshots
 
         public MatchSnapshot CaptureSnapshot()
         {
             var effects = new List<EffectSnapshot>();
-            void Add(GameObject go, PrimitiveType type, Color color)
-            {
-                effects.Add(new EffectSnapshot { primitive = (int)type,
-                    position = go.transform.position, scale = go.transform.localScale, color = color });
-            }
-            foreach (var p in projectiles) Add(p.Go, PrimitiveType.Sphere, p.Owner.Def.ColorLight);
-            foreach (var v in vortices) Add(v.Go, PrimitiveType.Cylinder, v.Owner.Def.Color);
-            foreach (var r in rings)
-                Add(r.Go, PrimitiveType.Cylinder, r.Go.GetComponent<Renderer>().sharedMaterial.GetColor(BaseColorId));
+            fx.CaptureEffects(effects);
             return new MatchSnapshot { host = FighterSnapshot.Capture(local),
                 guest = FighterSnapshot.Capture(foe), effects = effects.ToArray() };
         }
@@ -694,31 +326,7 @@ namespace Arena.Gameplay
 
             snapshot.host.Apply(local);
             snapshot.guest.Apply(foe);
-            int count = snapshot.effects.Length;
-            for (int i = replicatedEffects.Count - 1; i >= count; i--)
-            {
-                Object.Destroy(replicatedEffects[i]); replicatedEffects.RemoveAt(i);
-            }
-            for (int i = 0; i < count; i++)
-            {
-                var effect = snapshot.effects[i];
-                string name = "Replica_" + effect.primitive;
-                if (i < replicatedEffects.Count && replicatedEffects[i].name != name)
-                { Object.Destroy(replicatedEffects[i]); replicatedEffects[i] = null; }
-                GameObject go = i < replicatedEffects.Count ? replicatedEffects[i] : null;
-                if (go == null)
-                {
-                    go = GameObject.CreatePrimitive((PrimitiveType)effect.primitive);
-                    Object.Destroy(go.GetComponent<Collider>());
-                    go.name = name; go.transform.SetParent(FxRoot.transform, false);
-                    OwnedMaterial.Assign(go, MakeUnlit(effect.color));
-                    if (i < replicatedEffects.Count) replicatedEffects[i] = go;
-                    else replicatedEffects.Add(go);
-                }
-                go.transform.position = effect.position;
-                go.transform.localScale = effect.scale;
-                go.GetComponent<Renderer>().sharedMaterial.SetColor(BaseColorId, effect.color);
-            }
+            fx.SyncReplicated(snapshot.effects);
         }
 
         /// <summary>
@@ -735,27 +343,7 @@ namespace Arena.Gameplay
             var from = renderFrom;
             Ease(local, from?.host, renderTo.host, k);
             Ease(foe, from?.guest, renderTo.guest, k);
-
-            var to = renderTo.effects;
-            if (to == null) return;
-            var previous = from?.effects;
-            for (int i = 0; i < replicatedEffects.Count && i < to.Length; i++)
-            {
-                GameObject go = replicatedEffects[i];
-                if (go == null || to[i] == null) continue;
-                Vector3 position = to[i].position;
-                Vector3 scale = to[i].scale;
-                // Only blend when the slot still holds the same kind of effect;
-                // a respawned effect simply appears at its newest transform.
-                if (previous != null && i < previous.Length && previous[i] != null &&
-                    previous[i].primitive == to[i].primitive)
-                {
-                    position = Vector3.Lerp(previous[i].position, position, k);
-                    scale = Vector3.Lerp(previous[i].scale, scale, k);
-                }
-                go.transform.position = position;
-                go.transform.localScale = scale;
-            }
+            fx.EaseReplicated(from?.effects, renderTo.effects, k);
 
             static void Ease(FighterSim fighter, FighterSnapshot fromSnap,
                 FighterSnapshot toSnap, float k)
@@ -781,111 +369,11 @@ namespace Arena.Gameplay
             renderAge = 0f;
             renderInterval = 1f / 60f;
             lastSnapshotAt = -1f;
-            foreach (var p in projectiles) if (p.Go != null) Object.Destroy(p.Go);
-            foreach (var v in vortices) if (v.Go != null) Object.Destroy(v.Go);
-            foreach (var r in rings) if (r.Go != null) Object.Destroy(r.Go);
-            foreach (var go in replicatedEffects) if (go != null) Object.Destroy(go);
-            replicatedEffects.Clear();
             accumulatedTime = 0d;
-            projectiles.Clear();
-            vortices.Clear();
-            rings.Clear();
-            if (fxRoot != null) Object.Destroy(fxRoot);
-            fxRoot = null;
+            fx.Clear();
         }
 
         /// <summary>Where a blink may land: inside the same playable octagon.</summary>
         private Vector3 ClampToArena(Vector3 p) => GameConfig.ClampToPlay(p);
-
-        // The four diagonal faces of the playable octagon, as (x, z) signs.
-        private static readonly float[] DiagonalX = { 1f, 1f, -1f, -1f };
-        private static readonly float[] DiagonalZ = { 1f, -1f, 1f, -1f };
-
-        private static float WallFraction(Vector3 start, Vector3 end, float radius)
-        {
-            float x = GameConfig.ArenaWidth * 0.5f - 0.3f - radius;
-            float z = GameConfig.ArenaHeight * 0.5f - 0.3f - radius;
-            float diagonal = Mathf.Abs(start.x) + Mathf.Abs(start.z);
-            if (Mathf.Abs(start.x) >= x || Mathf.Abs(start.z) >= z ||
-                diagonal >= GameConfig.PlayDiagonal) return 0f;
-            Vector3 delta = end - start;
-            float fraction = 1f;
-            if (end.x > x) fraction = Mathf.Min(fraction, (x - start.x) / delta.x);
-            if (end.x < -x) fraction = Mathf.Min(fraction, (-x - start.x) / delta.x);
-            if (end.z > z) fraction = Mathf.Min(fraction, (z - start.z) / delta.z);
-            if (end.z < -z) fraction = Mathf.Min(fraction, (-z - start.z) / delta.z);
-
-            // A shot aimed at a corner leaves through the cut face, not a wall.
-            for (int i = 0; i < 4; i++)
-            {
-                float before = start.x * DiagonalX[i] + start.z * DiagonalZ[i];
-                float after = end.x * DiagonalX[i] + end.z * DiagonalZ[i];
-                if (after <= GameConfig.PlayDiagonal || after == before) continue;
-                fraction = Mathf.Min(fraction,
-                    (GameConfig.PlayDiagonal - before) / (after - before));
-            }
-            return Mathf.Clamp01(fraction);
-        }
-
-        // Relative-motion circle sweep on the ground plane, earliest time of impact.
-        private static bool SweptContact(Vector3 a0, Vector3 a1,
-            Vector3 b0, Vector3 b1, float radius, out float time)
-        {
-            Vector3 offset = a0 - b0;
-            Vector3 motion = (a1 - a0) - (b1 - b0);
-            offset.y = motion.y = 0f;
-            time = 0f;
-            float c = offset.sqrMagnitude - radius * radius;
-            if (c <= 0f) return true;
-            float a = motion.sqrMagnitude;
-            if (a <= 1e-10f) return false;
-            float b = Vector3.Dot(offset, motion);
-            float discriminant = b * b - a * c;
-            if (discriminant < 0f) return false;
-            time = (-b - Mathf.Sqrt(discriminant)) / a;
-            return time >= 0f && time <= 1f;
-        }
-
-        private static float FlatDistance(Vector3 a, Vector3 b)
-        {
-            float dx = a.x - b.x;
-            float dz = a.z - b.z;
-            return Mathf.Sqrt(dx * dx + dz * dz);
-        }
-
-        private static Material fxMaterialTemplate;
-
-        private static Material MakeUnlit(Color c)
-        {
-            Material m = null;
-            if (fxMaterialTemplate == null)
-            {
-                fxMaterialTemplate = Resources.Load<Material>("Arena/ArenaUnlit");
-            }
-
-            if (fxMaterialTemplate != null)
-            {
-                m = new Material(fxMaterialTemplate) { name = "SpellFx" };
-            }
-            else
-            {
-                if (fxShader == null)
-                {
-                    fxShader = Shader.Find("Universal Render Pipeline/Unlit");
-                    if (fxShader == null) fxShader = Shader.Find("Unlit/Color");
-                }
-                if (fxShader != null)
-                {
-                    m = new Material(fxShader) { name = "SpellFx" };
-                }
-            }
-
-            if (m != null)
-            {
-                if (m.HasProperty(BaseColorId)) m.SetColor(BaseColorId, c);
-                else m.color = c;
-            }
-            return m;
-        }
     }
 }

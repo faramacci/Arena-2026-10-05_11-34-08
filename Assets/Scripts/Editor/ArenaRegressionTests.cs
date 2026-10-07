@@ -148,6 +148,14 @@ namespace Arena.Tests
         private static void Invoke(object obj, string name) => obj.GetType().GetMethod(name,
             BindingFlags.Instance | BindingFlags.NonPublic).Invoke(obj, null);
 
+        // Spell effects live on MatchSim's FxSpawner collaborator; reach it so the
+        // orb-retention and guest-replication checks keep probing the real state.
+        private static object FxSpawner(MatchSim sim) => Field(sim, "fx").GetValue(sim);
+        private static System.Collections.ICollection Projectiles(MatchSim sim) =>
+            (System.Collections.ICollection)Field(FxSpawner(sim), "projectiles").GetValue(FxSpawner(sim));
+        private static GameObject EffectRoot(MatchSim sim) =>
+            (GameObject)Field(FxSpawner(sim), "fxRoot").GetValue(FxSpawner(sim));
+
         private static MatchSim Match(CharacterId id = CharacterId.Vanguard, bool bot = false)
         {
             CharacterView View(CharacterDef def, Vector3 pos)
@@ -294,9 +302,9 @@ namespace Arena.Tests
             inside.Foe.Position = new Vector3(-10f, 0, 0);
             inside.Cast(inside.Local, 0);
             for (int i = 0; i < 10; i++) inside.Tick(GameConfig.FixedTimestep, Vector3.zero);
-            Check(((System.Collections.ICollection)Field(inside, "projectiles").GetValue(inside)).Count == 0,
+            Check(Projectiles(inside).Count == 0,
                 "Orb crossing the wall from inside was retained");
-            var list = (System.Collections.ICollection)Field(s, "projectiles").GetValue(s);
+            var list = Projectiles(s);
             Check(list.Count == 0, "Orb beyond inner wall was retained");
         }
 
@@ -356,7 +364,7 @@ namespace Arena.Tests
                 if (!releasedMaterials.Contains(owner.Material)) releasedMaterials.Add(owner.Material);
             var sim = Match(CharacterId.Storm);
             sim.Cast(sim.Local, 0); sim.Cast(sim.Local, 1); sim.Cast(sim.Local, 2);
-            var root = (GameObject)Field(sim, "fxRoot").GetValue(sim);
+            var root = EffectRoot(sim);
             foreach (var owner in root.GetComponentsInChildren<OwnedMaterial>())
                 releasedMaterials.Add(owner.Material);
             Check(releasedMaterials.Count >= 10, "Missing ownership on generated renderers");
@@ -462,7 +470,7 @@ namespace Arena.Tests
             Near(guest.Local.Health, 42f);
             Near(guest.Foe.Cooldowns[0], host.Foe.Cooldowns[0]);
             Near((guest.Local.Forward - host.Local.Forward).magnitude, 0f);
-            var root = (GameObject)Field(guest, "fxRoot").GetValue(guest);
+            var root = EffectRoot(guest);
             Check(root.transform.childCount == state.effects.Length, "Effects missing on guest");
             for (int i = 0; i < 20; i++) guest.ApplySnapshot(state);
             Check(root.transform.childCount == state.effects.Length, "Replica effects leak per snapshot");
