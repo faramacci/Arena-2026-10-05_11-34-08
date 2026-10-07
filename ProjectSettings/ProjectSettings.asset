@@ -58,8 +58,8 @@ PlayerSettings:
   iosShowActivityIndicatorOnLoading: -1
   androidShowActivityIndicatorOnLoading: -1
   iosUseCustomAppBackgroundBehavior: 0
-  allowedAutorotateToPortrait: 1
-  allowedAutorotateToPortraitUpsideDown: 1
+  allowedAutorotateToPortrait: 0
+  allowedAutorotateToPortraitUpsideDown: 0
   allowedAutorotateToLandscapeRight: 1
   allowedAutorotateToLandscapeLeft: 1
   useOSAutorotation: 1
@@ -150,7 +150,8 @@ PlayerSettings:
   visionOSBundleVersion: 1.0
   tvOSBundleVersion: 1.0
   bundleVersion: 0.1.0
-  preloadedAssets: []
+  preloadedAssets:
+  - {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
   metroInputSource: 0
   wsaTransparentSwapchain: 0
   xboxOneDisableKinectGpuReservation: 1
@@ -188,7 +189,7 @@ PlayerSettings:
   stripEngineCode: 1
   iPhoneStrippingLevel: 0
   iPhoneScriptCallOptimization: 0
-  ForceInternetPermission: 0
+  ForceInternetPermission: 1
   ForceSDCardPermission: 0
   CreateWallpaper: 0
   androidSplitApplicationBinary: 0
@@ -834,7 +835,26 @@ PlayerSettings:
   webWasm2023: 1
   webEnableSubmoduleStrippingCompatibility: 0
   webProgressiveAssetLoading: 0
-  scriptingDefineSymbols: {}
+  scriptingDefineSymbols:
+    Android: SENTIS_ANALYTICS_ENABLED;APP_UI_EDITOR_ONLY;UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    EmbeddedLinux: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    GameCoreScarlett: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    GameCoreXboxOne: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    Kepler: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    LinuxHeadlessSimulation: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    Nintendo Switch: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    Nintendo Switch 2: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    PS4: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    PS5: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    QNX: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    Server: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    Standalone: SENTIS_ANALYTICS_ENABLED;APP_UI_EDITOR_ONLY;UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    VisionOS: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    WebGL: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    Windows Store Apps: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    XboxOne: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    iPhone: UNITY_MCP_READY;UNITY_MCP_DEPS_6
+    tvOS: UNITY_MCP_READY;UNITY_MCP_DEPS_6
   additionalCompilerArguments: {}
   platformArchitecture: {}
   scriptingBackend:
@@ -935,11 +955,11 @@ PlayerSettings:
   activeInputHandler: 1
   windowsGamepadBackendHint: 0
   enableDirectStorage: 0
-  cloudProjectId: 
+  cloudProjectId: 7cae3e1b-eb46-44d4-b7c4-525f77ee620f
   framebufferDepthMemorylessMode: 0
   qualitySettingsNames: []
-  projectName: 
-  organizationId: 
+  projectName: Arena
+  organizationId: farawacci
   cloudEnabled: 0
   legacyClampBlendShapeWeights: 0
   hmiLoadingImage: {fileID: 0}

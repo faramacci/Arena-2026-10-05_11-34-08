@@ -1,0 +1,10 @@
+Arena LAN verification
+
+Final Unity Play Mode: 23/23 passed; failures=0
+Final Unity process exit: 0
+All current Assets/Scripts C# sources byte-identical to final tested isolated copy.
+Standalone compile: exit 0 (40 sources, 471 references).
+
+Coverage: existing 13 gameplay regressions, independent two-player movement/casts, JSON snapshot replication, actual TCP loopback transport, invalid frames, inactivity timeout/reconnect, actual Host/Join menu flow (including the zone picked while waiting reaching the welcome and the arena, and the join phone's zone picker staying disabled), guest snapshot view interpolation, landscape-only player settings, countdown lifecycle, deferred runtime material destruction.
+
+Environment limitations: no Android device connected to ADB; no APK build/install, no generated Android manifest inspection and no physical hotspot test performed, so the guest lag fix and the landscape start are verified in Play Mode/settings only. Batch Unity emitted an unrelated SearchDatabase indexing exception; the Arena runner completed successfully. Rendering appearance and real-device FPS/latency are not verified.
