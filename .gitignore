@@ -116,3 +116,7 @@ InitTestScene*.unity*
 # Agent / tooling output (not part of the game)
 .claude/
 graphify-out/
+
+# Unity crash-recovery scenes (auto-generated, not part of the game)
+/[Aa]ssets/_Recovery/
+/[Aa]ssets/_Recovery.meta
