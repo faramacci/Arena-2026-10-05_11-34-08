@@ -85,3 +85,63 @@ weakened.
 
 - Compile: `bash verify_compile.sh` → `OK: compiled clean`.
 - Regression: `unity-mcp-cli run-tool script-execute` calling `Arena.Tests.ArenaRegressionTests.Run()`, then read `Temp/arena-regression-results.txt` → `25/25 passed; failures=0`.
+
+## 9. Known issues (Unity MCP) & workarounds
+
+### 9.1 `Console / Clear Logs` throws `IOException` (log file lock)
+
+The tool fails with:
+
+```
+IOException: The process cannot access the file
+'.../Temp/mcp-server/ai-editor-logs.txt' because it is being used by another process.
+```
+
+**Cause:** the MCP plugin keeps `Temp/mcp-server/ai-editor-logs.txt` open for writing, so the
+Clear-Logs tool cannot reopen/truncate it while the editor is running.
+
+**Workarounds (any of these):**
+- Prefer `Console / Get Logs` for reading; clear logs only when the tool actually succeeds.
+- Close (or stop the MCP connection from) the *AI Game Developer* window before clearing, so the writer releases the handle, then clear.
+- Clear the file out-of-band with the editor closed, or just delete `Temp/mcp-server/ai-editor-logs.txt` while Unity is shut down — it is regenerated on start.
+- If you need a clean run, capture the relevant window with `Console / Get Logs` first and filter client-side instead of relying on Clear.
+
+### 9.2 `Method C# / Call` (reflection) cannot find static methods
+
+Calling a static method (e.g. `Arena.Tests.ArenaRegressionTests.Run()`) returns
+`Method not found` even though the method exists and is `public static`. It also rejects a plain
+string for `filter`; `filter` must be a `MethodRef` **object**
+(`{"namespace": ..., "typeName": ..., "methodName": ...}`), and `gameObjectRef` must be an
+object (`{"name": ...}` / `{"instanceID": ...}`), not a string.
+
+**Workaround:** use **`Script / Execute`** instead. Full-code mode is the most reliable:
+
+```json
+{
+  "csharpCode": "public class Run { public static void Main() { Arena.Tests.ArenaRegressionTests.Run(); } }",
+  "className": "Run",
+  "methodName": "Main"
+}
+```
+
+Keep blocking work out of it (see 9.3).
+
+### 9.3 Blocking `Script / Execute` can wedge the editor and the MCP server
+
+Observed this session: a `Script / Execute` call that waited on a child process which never
+exited (an `adb logcat` whose stdout/stderr pipes were drained sequentially) blocked the Unity
+main thread. The MCP server then stopped answering (`http://localhost:25521` timed out) and the
+tool runner kept re-invoking the call, spawning a new `adb` each time.
+
+**Guidelines:**
+- Never wait on a child process from `Script / Execute` without a hard kill on timeout.
+- Drain a child's stdout **and** stderr concurrently (`ReadToEndAsync`) — reading them one after
+the other deadlocks once the second pipe's buffer fills.
+- Give every external command a timeout and kill it on expiry.
+- If the editor does become wedged, killing the child is not enough (it is relaunched) — bring
+  Unity to the foreground and, if it stays unresponsive, restart the editor. All work is committed
+  to git, so a restart loses nothing.
+
+### 9.4 Project path contains spaces
+
+See section 6 — move the project to a space-free path (e.g. `F:\UnityProjects\Arena`).
