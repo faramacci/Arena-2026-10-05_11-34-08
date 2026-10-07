@@ -107,7 +107,10 @@ namespace Arena
             menu.CancelRequested += ReturnToMenu;
 
             BuildCountdownLabel(canvas.transform);
+            BuildLogPathLabel(canvas.transform);
 
+            Debug.Log("[Bootstrap] boot complete (" +
+                      (Application.isEditor ? "editor" : "build") + ").");
             ShowMenu();
         }
 
@@ -176,6 +179,26 @@ namespace Arena
             countdownLabel.gameObject.SetActive(false);
         }
 
+        /// <summary>
+        /// Builds only: a small footer showing where this run's runtime log is
+        /// written, so it can be pulled off the phone without a USB cable. The
+        /// editor skips it entirely.
+        /// </summary>
+        private void BuildLogPathLabel(Transform canvas)
+        {
+            if (Application.isEditor) return;
+
+            RuntimeLogger.EnsureRunning(false);
+            string path = RuntimeLogger.CurrentFilePath ?? RuntimeLogger.LogDirectory;
+            if (string.IsNullOrEmpty(path)) return;
+
+            var label = UiFactory.CreateLabel("LogPath", canvas, "LOG: " + path, 18f,
+                UiFactory.Muted, TextAlignmentOptions.BottomLeft,
+                new Vector2(0f, 0f), new Vector2(0f, 0f),
+                new Vector2(16f, 12f), new Vector2(1000f, 34f));
+            UiFactory.AddOutline(label, new Color(0f, 0f, 0f, 0.85f), 2f);
+        }
+
         // ------------------------------------------------------------------ flow
 
         private void OnStartRequested(GameMode mode, ZoneShape zone,
@@ -195,6 +218,9 @@ namespace Arena
                 remoteCasts.Clear();
                 sendTimer = 0f;
                 network = mode == GameMode.LanHost ? LanSession.Host() : LanSession.Join(menu.HostAddress);
+                Debug.Log(mode == GameMode.LanHost
+                    ? $"[Network] hosting on TCP {LanSession.Port}."
+                    : $"[Network] joining {menu.HostAddress}:{LanSession.Port}.");
                 network.Received += OnNetworkMessage;
                 network.ConnectedToPeer += () =>
                 {
@@ -254,6 +280,8 @@ namespace Arena
             hud.ResetInput();
             hud.Show();
 
+            Debug.Log($"[Bootstrap] match start (mode={mode}, zone={zone}, " +
+                      $"local={localDef.DisplayName}, foe={foeDef.DisplayName}).");
             timer = countdownSeconds;
             phase = Phase.Countdown;
             countdownLabel.alpha = 1f;
@@ -271,12 +299,14 @@ namespace Arena
             countdownLabel.gameObject.SetActive(false);
             menu.Show();
             if (rig != null) rig.SetTarget(null);
+            Debug.Log("[Bootstrap] menu shown.");
         }
 
         private void ReturnToMenu()
         {
             CancelInvoke(nameof(HideCountdown));
             goTimer = -1f;
+            if (network != null) Debug.Log("[Network] session closed.");
             network?.Dispose();
             network = null;
             handshake = false;
@@ -318,6 +348,7 @@ namespace Arena
                 if (!handshake && message.kind == "hello" && ValidCharacter(message.character))
                 {
                     handshake = true;
+                    Debug.Log($"[Network] guest joined as {message.character}.");
                     // Read the live choice, not the one captured at Start:
                     // the host may still switch the zone while waiting.
                     networkZone = menu.Zone;
@@ -341,6 +372,7 @@ namespace Arena
                     ValidCharacter(message.hostCharacter) && (message.zone == ZoneShape.Circle || message.zone == ZoneShape.Square))
                 {
                     handshake = true;
+                    Debug.Log($"[Network] connected to host (zone={message.zone}).");
                     StartMatch(GameMode.LanJoin, message.zone, message.hostCharacter, message.character);
                 }
                 else if (handshake && message.kind == "state")
@@ -397,6 +429,7 @@ namespace Arena
             if (session.Error != null)
             {
                 string error = session.Error;
+                Debug.LogError("[Network] " + error);
                 ReturnToMenu();
                 menu.SetNetworkStatus(error, false);
                 return;
@@ -521,6 +554,7 @@ namespace Arena
         /// <summary>Freezes the match behind an end card, then returns to the menu.</summary>
         private void ShowEndCard(string text)
         {
+            Debug.Log($"[Bootstrap] result: {text}");
             CancelInvoke(nameof(HideCountdown));
             goTimer = -1f;
             endTimer = GameConfig.MatchEndDelay + 0.8f;

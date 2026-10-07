@@ -106,6 +106,9 @@ namespace Arena.Gameplay
             }
             local.View.SetFacing(local.Forward);
             foe.View.SetFacing(foe.Forward);
+
+            Debug.Log($"[MatchSim] match started (local={localDef.DisplayName}, " +
+                      $"foe={foeDef.DisplayName}, bot={foeIsBot}, zone={zoneShape}).");
         }
 
         // ---------------------------------------------------------------- tick
@@ -294,6 +297,8 @@ namespace Arena.Gameplay
             }
 
             if (caster.View != null) caster.View.PlayCast();
+            Debug.Log($"[MatchSim] {caster.Def.DisplayName} cast '{ab.DisplayName}' " +
+                      $"(slot={(AbilitySlot)slot})");
             return true;
         }
 
