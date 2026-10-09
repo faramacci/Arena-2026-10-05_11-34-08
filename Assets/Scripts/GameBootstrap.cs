@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
@@ -11,8 +12,12 @@ namespace Arena
 {
     /// <summary>
     /// Boots the whole game from an empty scene: EventSystem, MOBA camera rig,
-    /// generated arena, main menu and touch HUD, then runs the menu → match
-    /// flow.
+    /// generated arena, the two screens and the touch HUD, then runs the
+    /// flow — <b>mode choice → fighter picker → match</b>.
+    ///
+    /// Neither screen simulates anything: the picker only collects the fighter,
+    /// the zone, the opponent count (solo) and the host/join role (LAN), and the
+    /// match builds its own fighters and countdown when START is pressed.
     ///
     /// Self-installs on scene load and owns the LAN lifetime. Only the host
     /// simulates a network match; the guest renders host snapshots.
@@ -22,7 +27,10 @@ namespace Arena
     {
         private enum Phase
         {
-            Menu,
+            /// <summary>The mode tiles are up.</summary>
+            Modes,
+            /// <summary>Picking a fighter and the line-up for the chosen mode.</summary>
+            Select,
             Countdown,
             Playing
         }
@@ -32,7 +40,8 @@ namespace Arena
 
         private MobaCameraRig rig;
         private ArenaBuilder arena;
-        private MainMenuView menu;
+        private ModeSelectView modes;
+        private CharacterSelectView signup;
         private TouchHudView hud;
         private TextMeshProUGUI countdownLabel;
         private UiPulse countdownPulse;
@@ -40,9 +49,11 @@ namespace Arena
 
         private CharacterView localView;
         private CharacterView foeView;
+        /// <summary>Free-for-all fighters past the first two slots, destroyed with the match.</summary>
+        private readonly List<CharacterView> extraViews = new List<CharacterView>();
         private CharacterDef localDef;
 
-        private Phase phase = Phase.Menu;
+        private Phase phase = Phase.Modes;
         private float timer;
         private float goTimer = -1f;
         private LanSession network;
@@ -51,7 +62,7 @@ namespace Arena
         private ZoneShape networkZone;
         private float sendTimer;
         private Vector3 remoteInput;
-        private readonly System.Collections.Generic.Queue<int> remoteCasts = new System.Collections.Generic.Queue<int>();
+        private readonly Queue<int> remoteCasts = new Queue<int>();
         private bool IsGuest => network != null && !network.IsHost;
 
         /// <summary>Whole match state: physics, spells, zone and the bot brain.</summary>
@@ -59,6 +70,20 @@ namespace Arena
 
         /// <summary>Negative when no end card is up, otherwise seconds left.</summary>
         private float endTimer = -1f;
+
+        // ---- what the player chose on the way in -------------------------------
+        private GameMode mode = GameMode.Bot;
+        /// <summary>Who fights whom: slot 0 is this phone, the rest are bots.</summary>
+        private readonly LobbyRoster roster =
+            new LobbyRoster(LobbyRoster.MaxSlots, CharacterId.Vanguard);
+        private CharacterId chosenCharacter = CharacterId.Vanguard;
+        private ZoneShape zone = ZoneShape.Circle;
+        private int botCount = 1;
+        private int campaignStage = 1;
+        private bool campaignCleared;
+
+        /// <summary>The class a solo opponent takes: always the player's opposite.</summary>
+        private CharacterId OpponentClass => LobbyRoster.CycleCharacter(chosenCharacter, 1);
 
         // Spawns sit inside the enlarged zone so nobody starts taking damage.
         private static readonly Vector3 LocalSpawn = new Vector3(-10f, 0f, 0f);
@@ -102,16 +127,24 @@ namespace Arena
             hud.AbilityPressed += OnAbilityPressed;
             hud.MenuRequested += ReturnToMenu;
 
-            menu = MainMenuView.Build(canvas.transform);
-            menu.StartRequested += OnStartRequested;
-            menu.CancelRequested += ReturnToMenu;
+            modes = ModeSelectView.Build(canvas.transform);
+            modes.ModeChosen += OnModeChosen;
+
+            signup = CharacterSelectView.Build(canvas.transform);
+            signup.CharacterChosen += OnCharacterChosen;
+            signup.ZoneChosen += OnZoneChosen;
+            signup.BotCountChosen += OnBotCountChosen;
+            signup.StartRequested += BeginMatch;
+            signup.CancelRequested += ReturnToMenu;
 
             BuildCountdownLabel(canvas.transform);
             BuildLogPathLabel(canvas.transform);
 
+            roster.SetBotCount(botCount, OpponentClass);
+            ShowModeSelect();
+
             Debug.Log("[Bootstrap] boot complete (" +
                       (Application.isEditor ? "editor" : "build") + ").");
-            ShowMenu();
         }
 
         /// <summary>The scene ships without one, and pointer UI needs it.</summary>
@@ -199,145 +232,140 @@ namespace Arena
             UiFactory.AddOutline(label, new Color(0f, 0f, 0f, 0.85f), 2f);
         }
 
-        // ------------------------------------------------------------------ flow
+        // ------------------------------------------------------- screen one: modes
 
-        private void OnStartRequested(GameMode mode, ZoneShape zone,
-            CharacterId localId, CharacterId foeId)
+        /// <summary>Top-level screen: campaign, bots or local network.</summary>
+        private void ShowModeSelect()
         {
-            if (mode == GameMode.Bot)
+            CancelInvoke(nameof(HideCountdown));
+            goTimer = -1f;
+            endTimer = -1f;
+            phase = Phase.Modes;
+            hud.Hide();
+            countdownLabel.gameObject.SetActive(false);
+            signup.Hide();
+            modes.SetCampaignStage(campaignStage, GameConfig.CampaignStages, campaignCleared);
+            modes.Show();
+            if (rig != null) rig.SetTarget(null);
+        }
+
+        /// <summary>A mode tile was tapped: set the line-up up and go practise.</summary>
+        private void OnModeChosen(GameMode picked)
+        {
+            mode = picked == GameMode.LanJoin ? GameMode.LanHost : picked;
+            if (mode == GameMode.Campaign && campaignCleared)
             {
-                StartMatch(mode, zone, localId, foeId);
+                campaignCleared = false;
+                campaignStage = 1;
+            }
+
+            roster.SetBotCount(mode == GameMode.Campaign ? campaignStage : botCount, OpponentClass);
+            Debug.Log($"[Bootstrap] mode chosen: {mode}.");
+            OpenPicker();
+        }
+
+        // --------------------------------------------------- screen two: the picker
+
+        /// <summary>
+        /// Opens the fighter picker for the chosen mode. Nothing is simulated
+        /// here: the match builds its own fighters and countdown on START.
+        /// </summary>
+        private void OpenPicker()
+        {
+            CancelInvoke(nameof(HideCountdown));
+            goTimer = -1f;
+            endTimer = -1f;
+            countdownLabel.gameObject.SetActive(false);
+            modes.Hide();
+
+            signup.Show(mode, chosenCharacter, zone, botCount, campaignStage);
+            phase = Phase.Select;
+            Debug.Log($"[Bootstrap] picker: mode={mode}, fighter={chosenCharacter}, " +
+                      $"zone={zone}, {roster.BotCount} opponent(s).");
+        }
+
+        /// <summary>The pick only has to survive until the match spawns it.</summary>
+        private void OnCharacterChosen(CharacterId id)
+        {
+            chosenCharacter = id;
+            roster.SetCharacter(LobbyRoster.LeaderIndex, id);
+            roster.SetBotCount(mode == GameMode.Campaign ? campaignStage : botCount, OpponentClass);
+        }
+
+        /// <summary>
+        /// The shape stays live while a host waits for its guest; the match
+        /// applies it to the arena when it actually starts.
+        /// </summary>
+        private void OnZoneChosen(ZoneShape shape) => zone = shape;
+
+        private void OnBotCountChosen(int bots)
+        {
+            botCount = bots;
+            if (mode == GameMode.Campaign) return;   // the campaign owns its stage count
+            roster.SetBotCount(bots, OpponentClass);
+            Debug.Log($"[Bootstrap] {bots} opponent(s) for the next match.");
+        }
+
+        /// <summary>START, pressed on the picker.</summary>
+        private void BeginMatch()
+        {
+            if (phase != Phase.Select) return;
+            mode = signup.Mode;      // a LAN picker can still flip host ⇄ join
+            signup.SetStatus(string.Empty, false);
+
+            if (mode == GameMode.LanHost || mode == GameMode.LanJoin)
+            {
+                StartNetwork();
                 return;
             }
+
+            StartMatch(mode, zone, chosenCharacter, OpponentClass);
+        }
+
+        // ------------------------------------------------------------- networking
+
+        /// <summary>Hosts or joins according to the address the player typed.</summary>
+        private void StartNetwork()
+        {
             try
             {
-                networkCharacter = localId;
+                networkCharacter = chosenCharacter;
                 networkZone = zone;
                 handshake = false;
                 remoteInput = Vector3.zero;
                 remoteCasts.Clear();
                 sendTimer = 0f;
-                network = mode == GameMode.LanHost ? LanSession.Host() : LanSession.Join(menu.HostAddress);
+                network = mode == GameMode.LanHost
+                    ? LanSession.Host()
+                    : LanSession.Join(signup.HostAddress);
                 Debug.Log(mode == GameMode.LanHost
                     ? $"[Network] hosting on TCP {LanSession.Port}."
-                    : $"[Network] joining {menu.HostAddress}:{LanSession.Port}.");
+                    : $"[Network] joining {signup.HostAddress}:{LanSession.Port}.");
                 network.Received += OnNetworkMessage;
                 network.ConnectedToPeer += () =>
                 {
                     if (network != null && !network.IsHost)
                         network.Send(new LanMessage { kind = "hello", character = networkCharacter });
                 };
-                menu.SetNetworkStatus(mode == GameMode.LanHost ?
-                    "Host IP: " + LanSession.LocalAddresses() + "\nWaiting for player (TCP " + LanSession.Port + ")" :
-                    "Connecting to " + menu.HostAddress + "...", true);
+                signup.SetStatus(mode == GameMode.LanHost
+                    ? "Host IP: " + LanSession.LocalAddresses() + " — waiting for player (TCP " + LanSession.Port + ")"
+                    : "Connecting to " + signup.HostAddress + "…", true);
             }
             catch (System.Exception ex) when (ex is System.Net.Sockets.SocketException || ex is System.ArgumentException ||
                                               ex is System.Net.NetworkInformation.NetworkInformationException)
             {
                 ReturnToMenu();
-                menu.SetNetworkStatus(ex.Message, false);
+                modes.SetNotice(ex.Message);
             }
         }
 
-        private void StartMatch(GameMode mode, ZoneShape zone,
-            CharacterId localId, CharacterId foeId)
+        private void CloseNetwork()
         {
-            CancelInvoke(nameof(HideCountdown));
-            goTimer = -1f;
-            menu.Hide();
-
-            arena.SetShape(zone);
-
-            localDef = GameConfig.Get(localId);
-            CharacterDef foeDef = GameConfig.Get(foeId);
-
-            if (localView != null) Destroy(localView.gameObject);
-            if (foeView != null) Destroy(foeView.gameObject);
-
-            localView = CharacterView.Create(localDef, LocalSpawn, arena.transform);
-            foeView = CharacterView.Create(foeDef, FoeSpawn, arena.transform);
-
-            rig.SetTarget(IsGuest ? foeView.transform : localView.transform);
-
-            hud.BindCharacter(IsGuest ? foeDef : localDef);
-            hud.SetLocalHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
-            endTimer = -1f;
-            lastCountShown = -1;
-
-            // Health and the English display name live on each fighter's
-            // floating nameplate now — the HUD carries no corner plates.
-            localView.SetName(localDef.DisplayName);
-            foeView.SetName(foeDef.DisplayName);
-            localView.SetHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
-            foeView.SetHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
-
-            // Everything that plays the match (movement, spells, zone, bot)
-            // lives in MatchSim; the bootstrap only drives phases and UI.
-            if (sim != null) sim.Clear();
-            sim = new MatchSim(localDef, foeDef, mode == GameMode.Bot,
-                localView, foeView, zone);
-
-            hud.ResetInput();
-            hud.Show();
-
-            Debug.Log($"[Bootstrap] match start (mode={mode}, zone={zone}, " +
-                      $"local={localDef.DisplayName}, foe={foeDef.DisplayName}).");
-            timer = countdownSeconds;
-            phase = Phase.Countdown;
-            countdownLabel.alpha = 1f;
-            countdownLabel.text = Mathf.CeilToInt(timer).ToString();
-            countdownLabel.gameObject.SetActive(true);
-        }
-
-        private void ShowMenu()
-        {
-            CancelInvoke(nameof(HideCountdown));
-            goTimer = -1f;
-            phase = Phase.Menu;
-            endTimer = -1f;
-            hud.Hide();
-            countdownLabel.gameObject.SetActive(false);
-            menu.Show();
-            if (rig != null) rig.SetTarget(null);
-            Debug.Log("[Bootstrap] menu shown.");
-        }
-
-        private void ReturnToMenu()
-        {
-            CancelInvoke(nameof(HideCountdown));
-            goTimer = -1f;
             if (network != null) Debug.Log("[Network] session closed.");
             network?.Dispose();
             network = null;
             handshake = false;
             remoteCasts.Clear();
-            if (sim != null)
-            {
-                sim.Clear();
-                sim = null;
-            }
-            if (localView != null) Destroy(localView.gameObject);
-            if (foeView != null) Destroy(foeView.gameObject);
-            localView = null;
-            foeView = null;
-            ShowMenu();
-            menu.SetNetworkStatus("Choose Solo, Host or Join.", false);
-        }
-
-        private void OnDestroy()
-        {
-            CancelInvoke();
-            network?.Dispose();
-            sim?.Clear();
-        }
-
-        private void OnApplicationPause(bool paused)
-        {
-            if (paused && network != null)
-            {
-                ReturnToMenu();
-                menu.SetNetworkStatus("LAN session ended while the app was in background. Reconnect.", false);
-            }
         }
 
         private void OnNetworkMessage(LanMessage message)
@@ -351,7 +379,7 @@ namespace Arena
                     Debug.Log($"[Network] guest joined as {message.character}.");
                     // Read the live choice, not the one captured at Start:
                     // the host may still switch the zone while waiting.
-                    networkZone = menu.Zone;
+                    networkZone = signup.Zone;
                     StartMatch(GameMode.LanHost, networkZone, networkCharacter, message.character);
                     network.Send(new LanMessage { kind = "welcome", hostCharacter = networkCharacter,
                         character = message.character, zone = networkZone });
@@ -402,22 +430,30 @@ namespace Arena
             }
         }
 
-        private static bool ValidCharacter(CharacterId id) => id == CharacterId.Vanguard || id == CharacterId.Storm;
+        private static bool ValidCharacter(CharacterId id) =>
+            id == CharacterId.Vanguard || id == CharacterId.Storm || id == CharacterId.Assassin;
         private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
         private static bool Finite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
         private static bool ValidSnapshot(LanMessage message)
         {
             bool Fighter(FighterSnapshot f) => f != null && Finite(f.position) && Finite(f.forward) &&
                 Finite(f.health) && f.health >= 0f && f.health <= GameConfig.MaxHealth &&
+                Finite(f.haste) && f.haste >= 0f && f.haste <= GameConfig.HasteMaxSeconds &&
                 f.cooldowns != null && f.cooldowns.Length == 3 &&
                 System.Array.TrueForAll(f.cooldowns, c => Finite(c) && c >= 0f);
             var s = message.snapshot;
             if (message.phase < 0 || message.phase > 2 || !Finite(message.timer) || s == null ||
                 !Fighter(s.host) || !Fighter(s.guest) || s.effects == null || s.effects.Length > 32) return false;
             foreach (var fx in s.effects)
+                // Every thrown weapon is a cube — blade, dagger and shield are the
+                // same slab at different scales — so rejecting cubes would reject
+                // any host that throws one.
                 if (fx == null || !Finite(fx.position) || !Finite(fx.scale) ||
-                    (fx.primitive != (int)PrimitiveType.Sphere && fx.primitive != (int)PrimitiveType.Cylinder) ||
-                    !Finite(fx.color.r) || !Finite(fx.color.g) || !Finite(fx.color.b) || !Finite(fx.color.a)) return false;
+                    (fx.primitive != (int)PrimitiveType.Sphere &&
+                     fx.primitive != (int)PrimitiveType.Cylinder &&
+                     fx.primitive != (int)PrimitiveType.Cube) ||
+                    !Finite(fx.color.r) || !Finite(fx.color.g) || !Finite(fx.color.b) ||
+                    !Finite(fx.color.a)) return false;
             return true;
         }
 
@@ -431,7 +467,7 @@ namespace Arena
                 string error = session.Error;
                 Debug.LogError("[Network] " + error);
                 ReturnToMenu();
-                menu.SetNetworkStatus(error, false);
+                modes.SetNotice(error);
                 return;
             }
             if (!handshake) return;
@@ -449,13 +485,148 @@ namespace Arena
             session.Pump();
         }
 
+        // -------------------------------------------------------------- the match
+
+        private void StartMatch(GameMode mode, ZoneShape zone,
+            CharacterId localId, CharacterId foeId)
+        {
+            CancelInvoke(nameof(HideCountdown));
+            goTimer = -1f;
+            modes.Hide();
+            signup.Hide();
+
+            arena.SetShape(zone);
+
+            localDef = GameConfig.Get(localId);
+            CharacterDef foeDef = GameConfig.Get(foeId);
+
+            if (localView != null) Destroy(localView.gameObject);
+            if (foeView != null) Destroy(foeView.gameObject);
+
+            ClearExtraViews();
+            localView = CharacterView.Create(localDef, LocalSpawn, arena.transform);
+            foeView = CharacterView.Create(foeDef, FoeSpawn, arena.transform);
+
+            rig.SetTarget(IsGuest ? foeView.transform : localView.transform);
+
+            hud.BindCharacter(IsGuest ? foeDef : localDef);
+            hud.SetLocalHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
+            endTimer = -1f;
+            lastCountShown = -1;
+
+            // Health and the English display name live on each fighter's
+            // floating nameplate now — the HUD carries no corner plates.
+            localView.SetName(localDef.DisplayName);
+            foeView.SetName(foeDef.DisplayName);
+            localView.SetHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
+            foeView.SetHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
+
+            // Everything that plays the match (movement, spells, zone, bot)
+            // lives in MatchSim; the bootstrap only drives phases and UI.
+            if (sim != null) sim.Clear();
+            sim = mode == GameMode.Bot || mode == GameMode.Campaign
+                ? new MatchSim(SoloSetups(localDef, foeDef), zone)
+                : new MatchSim(localDef, foeDef, false, localView, foeView, zone);
+
+            hud.ResetInput();
+            hud.Show();
+
+            Debug.Log($"[Bootstrap] match start (mode={mode}, zone={zone}, " +
+                      $"local={localDef.DisplayName}, foe={foeDef.DisplayName}).");
+            timer = countdownSeconds;
+            phase = Phase.Countdown;
+            countdownLabel.alpha = 1f;
+            countdownLabel.text = Mathf.CeilToInt(timer).ToString();
+            countdownLabel.gameObject.SetActive(true);
+        }
+
+        /// <summary>
+        /// Solo free-for-all line-up: the player, the first opponent, then one
+        /// fighter per extra bot the picker asked for. Characters cycle so a
+        /// crowded arena is not six copies of the same class, and the extras are
+        /// spread around the ring instead of stacking on the opening duellists.
+        /// </summary>
+        private List<MatchSim.Setup> SoloSetups(CharacterDef localDef, CharacterDef foeDef)
+        {
+            var setups = new List<MatchSim.Setup>
+            {
+                new MatchSim.Setup { Def = localDef, View = localView, IsBot = false },
+                new MatchSim.Setup { Def = foeDef, View = foeView, IsBot = true }
+            };
+
+            int bots = roster.BotCount;      // slot 1 already is the first bot
+            for (int i = 1; i < bots; i++)
+            {
+                CharacterDef def = GameConfig.Get(LobbyRoster.CycleCharacter(foeDef.Id, i));
+                var view = CharacterView.Create(def, RingSpawn(i, bots), arena.transform);
+                view.SetName(def.DisplayName);
+                view.SetHealth(GameConfig.MaxHealth, GameConfig.MaxHealth);
+                extraViews.Add(view);
+                setups.Add(new MatchSim.Setup { Def = def, View = view, IsBot = true });
+            }
+            return setups;
+        }
+
+        /// <summary>Even spread on a ring clear of the two opening positions.</summary>
+        private static Vector3 RingSpawn(int index, int total)
+        {
+            float angle = Mathf.PI * 0.5f + index / (float)Mathf.Max(1, total) * Mathf.PI * 2f;
+            float radius = GameConfig.PlayReach * 0.55f;
+            return new Vector3(Mathf.Cos(angle) * radius, 0f, Mathf.Sin(angle) * radius);
+        }
+
+        private void ClearExtraViews()
+        {
+            for (int i = 0; i < extraViews.Count; i++)
+                if (extraViews[i] != null) Destroy(extraViews[i].gameObject);
+            extraViews.Clear();
+        }
+
+        /// <summary>Back to the mode tiles, tearing the world and any session down.</summary>
+        private void ReturnToMenu()
+        {
+            // Logged with a stack: whatever bounces the player back to the tiles
+            // is worth knowing about, and the caller is the interesting half.
+            Debug.Log("[Bootstrap] back to the mode tiles.");
+            CancelInvoke(nameof(HideCountdown));
+            goTimer = -1f;
+            CloseNetwork();
+            if (sim != null)
+            {
+                sim.Clear();
+                sim = null;
+            }
+            if (localView != null) Destroy(localView.gameObject);
+            if (foeView != null) Destroy(foeView.gameObject);
+            localView = null;
+            foeView = null;
+            ClearExtraViews();
+            ShowModeSelect();
+        }
+
+        private void OnDestroy()
+        {
+            CancelInvoke();
+            network?.Dispose();
+            sim?.Clear();
+        }
+
+        private void OnApplicationPause(bool paused)
+        {
+            if (paused && network != null)
+            {
+                ReturnToMenu();
+                modes.SetNotice("LAN session ended while the app was in background. Reconnect.");
+            }
+        }
+
         // ------------------------------------------------------------------ frame
 
         private void Update()
         {
             // Legacy Input throws when the project runs on Input System only.
             var kb = Keyboard.current;
-            if (kb != null && kb.escapeKey.wasPressedThisFrame && (phase != Phase.Menu || network != null))
+            if (kb != null && kb.escapeKey.wasPressedThisFrame && (phase != Phase.Modes || network != null))
             {
                 ReturnToMenu();
                 return;
@@ -473,6 +644,10 @@ namespace Arena
 
             switch (phase)
             {
+                case Phase.Modes:
+                    break;
+                case Phase.Select:
+                    break;
                 case Phase.Countdown:
                     if (!IsGuest) StepCountdown();
                     break;
@@ -546,12 +721,13 @@ namespace Arena
                 hud.SetCooldown(i, sim.Local.Cooldowns[i]);
             hud.SetLocalHealth(sim.Local.Health, GameConfig.MaxHealth);
 
-            if (sim.Local.Dead && sim.Foe.Dead) ShowEndCard("DRAW!");
-            else if (sim.Local.Dead) ShowEndCard("KO!");
-            else if (sim.Foe.Dead) ShowEndCard("WIN!");
+            // Free-for-all: the player's own death ends their match even while the
+            // bots fight on, and the last fighter standing takes the arena.
+            if (sim.Local.Dead) ShowEndCard(sim.AliveCount == 0 ? "DRAW!" : "DEFEAT!");
+            else if (sim.MatchOver) ShowEndCard("WIN!");
         }
 
-        /// <summary>Freezes the match behind an end card, then returns to the menu.</summary>
+        /// <summary>Freezes the match behind an end card, then returns to the tiles.</summary>
         private void ShowEndCard(string text)
         {
             Debug.Log($"[Bootstrap] result: {text}");
@@ -562,6 +738,20 @@ namespace Arena
             countdownLabel.alpha = 1f;
             countdownLabel.gameObject.SetActive(true);
             if (countdownPulse != null) countdownPulse.PlayPop(0.22f);
+
+            // Beating a campaign stage promotes the next one, so the mode screen
+            // keeps score between runs and a loss simply replays the stage.
+            if (mode != GameMode.Campaign || text != "WIN!") return;
+            if (campaignStage >= GameConfig.CampaignStages)
+            {
+                campaignCleared = true;
+                Debug.Log("[Campaign] the arena is cleared — every stage beaten.");
+            }
+            else
+            {
+                campaignStage++;
+                Debug.Log($"[Campaign] stage cleared — next up is stage {campaignStage}.");
+            }
         }
 
         private void OnAbilityPressed(int slot)

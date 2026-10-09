@@ -23,11 +23,14 @@ namespace Arena.Tests
         private const string Pending = "Arena.Regression.Pending";
         private const string Restore = "Arena.Regression.RestoreEditMode";
         private const string RestorePause = "Arena.Regression.RestorePause";
+        private const string Owned = "Arena.Regression.OwnsSession";
+        private const string Attempts = "Arena.Regression.Attempts";
         private const string Request = "Temp/arena-regression.request";
         private const string Result = "Temp/arena-regression-results.txt";
         private static readonly List<GameObject> owned = new List<GameObject>();
         private static readonly List<MatchSim> sims = new List<MatchSim>();
         private static double readyAt;
+        private static double progressedAt;
         private static IEnumerator execution;
         private static int resumeAfterFrame;
 
@@ -40,11 +43,18 @@ namespace Arena.Tests
                 throw new InvalidOperationException("Wait for Unity to finish compiling/importing.");
             Directory.CreateDirectory("Temp");
             File.WriteAllText(Result, "RUNNING\n");
-            SessionState.SetBool(Restore, !EditorApplication.isPlaying);
+            // Always run in a session this harness booted itself. A compile that
+            // lands while Play Mode is running (Enter Play Mode Options ship
+            // with Reload Domain and Reload Scene both off) wipes every runtime
+            // button listener, so a reused session would click dead tiles and
+            // fail the UI tests for no reason in the game code.
+            SessionState.SetBool(Restore, true);
             SessionState.SetBool(RestorePause, EditorApplication.isPaused);
             SessionState.SetBool(Pending, true);
-            readyAt = EditorApplication.timeSinceStartup + 2d;
-            if (!EditorApplication.isPlaying) EditorApplication.isPlaying = true;
+            SessionState.SetBool(Owned, false);
+            SessionState.SetInt(Attempts, 0);
+            readyAt = EditorApplication.timeSinceStartup + 1.5d;
+            if (EditorApplication.isPlaying) EditorApplication.isPlaying = false;
         }
 
         private static void Poll()
@@ -52,29 +62,110 @@ namespace Arena.Tests
             if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
             if (execution != null)
             {
-                EditorApplication.QueuePlayerLoopUpdate();
-                if (Application.isBatchMode) EditorApplication.Step();
-                if (Time.frameCount < resumeAfterFrame) return;
-                if (!execution.MoveNext()) execution = null;
-                resumeAfterFrame = Time.frameCount + 2;
-                return;
+                // The suite is driven frame by frame, so a dead session or a
+                // frozen editor loop would leave this branch spinning forever.
+                if (!EditorApplication.isPlaying) execution = null;
+                else
+                {
+                    // Frames cannot be trusted here: an editor window that is not
+                    // in front has its loop throttled to a crawl (measured at
+                    // about one frame per second), which used to stall the suite
+                    // between tests. Pause and step the loop by hand instead,
+                    // which works no matter what covers the window.
+                    if (!EditorApplication.isPaused)
+                    {
+                        SessionState.SetBool(RestorePause, true);
+                        EditorApplication.isPaused = true;
+                        return;
+                    }
+                    if (EditorApplication.timeSinceStartup - progressedAt > 120d)
+                    {
+                        execution = null;
+                        Abort("the editor stopped advancing frames");
+                        return;
+                    }
+                    EditorApplication.QueuePlayerLoopUpdate();
+                    if (Time.frameCount < resumeAfterFrame)
+                    {
+                        EditorApplication.Step();
+                        return;
+                    }
+                    progressedAt = EditorApplication.timeSinceStartup;
+                    if (!execution.MoveNext())
+                    {
+                        execution = null;
+                        SessionState.SetBool(Pending, false);
+                        SessionState.SetBool(Owned, false);
+                        if (EditorApplication.isPaused) EditorApplication.isPaused = false;
+                    }
+                    resumeAfterFrame = Time.frameCount + 2;
+                    return;
+                }
             }
             if (File.Exists(Request) && !SessionState.GetBool(Pending, false))
             {
                 File.Delete(Request);
                 Run();
             }
-            if (SessionState.GetBool(Pending, false) && EditorApplication.isPlaying && EditorApplication.isPaused)
+            if (!SessionState.GetBool(Pending, false) ||
+                EditorApplication.timeSinceStartup < readyAt) return;
+            if (!SessionState.GetBool(Owned, false))
+            {
+                // Take ownership of the session instead of reusing one: a session
+                // that outlived a compile cannot be trusted with the UI tests
+                // (see Run).
+                if (EditorApplication.isPlaying)
+                {
+                    EditorApplication.isPlaying = false;
+                    readyAt = EditorApplication.timeSinceStartup + 1.5d;
+                }
+                else
+                {
+                    EditorApplication.isPlaying = true;
+                    SessionState.SetBool(Owned, true);
+                    readyAt = EditorApplication.timeSinceStartup + 2d;   // let it boot
+                }
+                return;
+            }
+            if (!EditorApplication.isPlaying)
+            {
+                // A compile can take our session down mid-run. Try again, but
+                // hand the poller a result after a few attempts instead of
+                // leaving a file that says RUNNING forever.
+                int attempt = SessionState.GetInt(Attempts, 0) + 1;
+                SessionState.SetInt(Attempts, attempt);
+                SessionState.SetBool(Owned, false);
+                if (attempt > 3) Abort($"the play session died {attempt - 1} times mid-run");
+                else readyAt = EditorApplication.timeSinceStartup + 1.5d;
+                return;
+            }
+            if (EditorApplication.isPaused)
             {
                 SessionState.SetBool(RestorePause, true);
                 EditorApplication.isPaused = false;
+                return;
             }
-            if (!SessionState.GetBool(Pending, false) || !EditorApplication.isPlaying ||
-                EditorApplication.timeSinceStartup < readyAt || EditorApplication.isPaused) return;
-            SessionState.SetBool(Pending, false);
             execution = Execute();
             resumeAfterFrame = Time.frameCount;
+            progressedAt = EditorApplication.timeSinceStartup;
             EditorApplication.QueuePlayerLoopUpdate();
+        }
+
+        /// <summary>
+        /// Leaves a readable result behind when no run could be completed, so a
+        /// caller waiting on the file is never left hanging on "RUNNING".
+        /// </summary>
+        private static void Abort(string reason)
+        {
+            File.WriteAllLines(Result, new[]
+            {
+                "0/0 passed; failures=1",
+                "FAIL run aborted: " + reason
+            });
+            Debug.LogError("Arena regressions aborted: " + reason);
+            SessionState.SetBool(Pending, false);
+            SessionState.SetBool(Owned, false);
+            if (SessionState.GetBool(Restore, false)) EditorApplication.isPlaying = false;
         }
 
         private static IEnumerator Execute()
@@ -89,20 +180,27 @@ namespace Arena.Tests
                 { "30/60/120 FPS produce identical state", FrameRates },
                 { "Catch-up work is bounded and backlog is retained", CatchUp },
                 { "Half stick produces half acceleration", AnalogAcceleration },
-                { "Fast charge crossing a moving target hits exactly once", Charge },
+                { "Shield Throw flies out, lands once each way and comes home", ShieldThrow },
+                { "Dagger Throw outruns an orb and is spent on its hit", DaggerThrow },
+                { "Shadowstep trades the ice for grip and speed for three seconds", Shadowstep },
+                { "Blade Wave throws a fan that charges each fighter once", BladeWave },
                 { "Orb sweeps moving target and respects invulnerability", Orb },
                 { "Orb cannot hit a target beyond the wall", OrbWall },
                 { "Blink teleport does not become a swept attack", Blink },
-                { "Area spells respect range and cooldown", Area },
+                { "Earthrift corridor hit respects length, width and cooldown", Area },
+                { "Frost Aegis soaks damage, replicates and expires", Aegis },
                 { "Vortex pulls and bursts", Vortex },
                 { "Overlapping fighters and bot stay finite", Overlap },
                 { "Reload validation safely recreates property block", Reload },
                 { "Both fighters accept independent movement and casts", TwoPlayers },
+                { "Lobby roster fills bots, opens slots and gates the start", Lobby },
+                { "Mode tiles lead into the fighter picker and into the match", Flow },
+                { "Free-for-all keeps every fighter on the sand and is decided by survival", FreeForAll },
                 { "Snapshots replicate health, cooldowns, facing and effects", Snapshots },
                 { "LAN loopback framing, handshake, input and disconnect", LanTransport },
                 { "LAN rejects invalid addresses and oversized frames", LanValidation },
                 { "LAN timeout and cancel release listener for reconnect", LanTimeout },
-                { "Menu Host/Join drives actual gameplay and disconnect recovery", LanMenuFlow },
+                { "Mode tiles + fighter picker drive the LAN match and disconnect recovery", LanMenuFlow },
                 { "Guest view eases between host snapshots", SnapshotSmoothing },
                 { "Landscape-only orientation for rotation-locked phones", Orientation },
                 { "Countdown restart and result are immune to stale hide timers", CountdownLifecycle },
@@ -132,6 +230,7 @@ namespace Arena.Tests
             File.WriteAllLines(Result, results);
             if (failed == 0) Debug.Log("Arena regressions: " + results[0]);
             else Debug.LogError("Arena regressions: " + string.Join("\n", results));
+            if (EditorApplication.isPaused) EditorApplication.isPaused = false;
             if (SessionState.GetBool(Restore, false)) EditorApplication.isPlaying = false;
             else EditorApplication.isPaused = SessionState.GetBool(RestorePause, false);
             if (Application.isBatchMode) EditorApplication.Exit(failed == 0 ? 0 : 1);
@@ -145,6 +244,9 @@ namespace Arena.Tests
         { Check(Mathf.Abs(actual - expected) <= tolerance, $"Expected {expected}, got {actual}"); }
         private static FieldInfo Field(object obj, string name) => obj.GetType().GetField(name,
             BindingFlags.Instance | BindingFlags.NonPublic);
+        /// <summary>Like <see cref="Field"/>, but also finds public fields (FxSpawner's records are public).</summary>
+        private static FieldInfo AnyField(object obj, string name) => obj.GetType().GetField(name,
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
         private static void Invoke(object obj, string name) => obj.GetType().GetMethod(name,
             BindingFlags.Instance | BindingFlags.NonPublic).Invoke(obj, null);
 
@@ -153,10 +255,27 @@ namespace Arena.Tests
         private static object FxSpawner(MatchSim sim) => Field(sim, "fx").GetValue(sim);
         private static System.Collections.ICollection Projectiles(MatchSim sim) =>
             (System.Collections.ICollection)Field(FxSpawner(sim), "projectiles").GetValue(FxSpawner(sim));
+        private static Vector3 ProjectileVelocity(object projectile) =>
+            (Vector3)AnyField(projectile, "Velocity").GetValue(projectile);
+        private static System.Collections.ICollection Vortices(MatchSim sim) =>
+            (System.Collections.ICollection)Field(FxSpawner(sim), "vortices").GetValue(FxSpawner(sim));
+        private static object FirstVortex(MatchSim sim)
+        {
+            foreach (var hazard in Vortices(sim)) return hazard;
+            return null;
+        }
+        private static System.Collections.ICollection Warnings(MatchSim sim) =>
+            (System.Collections.ICollection)Field(FxSpawner(sim), "warnings").GetValue(FxSpawner(sim));
+        private static object FirstWarning(MatchSim sim)
+        {
+            foreach (var warning in Warnings(sim)) return warning;
+            return null;
+        }
         private static GameObject EffectRoot(MatchSim sim) =>
             (GameObject)Field(FxSpawner(sim), "fxRoot").GetValue(FxSpawner(sim));
 
-        private static MatchSim Match(CharacterId id = CharacterId.Vanguard, bool bot = false)
+        private static MatchSim Match(CharacterId id = CharacterId.Vanguard, bool bot = false,
+            int extraBots = 0)
         {
             CharacterView View(CharacterDef def, Vector3 pos)
             {
@@ -169,8 +288,18 @@ namespace Arena.Tests
             }
             var a = GameConfig.Get(id);
             var b = GameConfig.Storm;
-            var sim = new MatchSim(a, b, bot, View(a, Vector3.zero),
-                View(b, new Vector3(10f, 0f, 0f)), ZoneShape.Circle);
+            var setups = new List<MatchSim.Setup>
+            {
+                new MatchSim.Setup { Def = a, View = View(a, Vector3.zero), IsBot = false },
+                new MatchSim.Setup { Def = b, View = View(b, new Vector3(10f, 0f, 0f)), IsBot = bot }
+            };
+            for (int i = 0; i < extraBots; i++)
+            {
+                var def = GameConfig.Get(LobbyRoster.CycleCharacter(b.Id, i + 1));
+                var spot = new Vector3(0f, 0f, 12f + i * 3f);
+                setups.Add(new MatchSim.Setup { Def = def, View = View(def, spot), IsBot = true });
+            }
+            var sim = new MatchSim(setups, ZoneShape.Circle);
             sims.Add(sim);
             return sim;
         }
@@ -231,7 +360,7 @@ namespace Arena.Tests
             foreach (int fps in new[] { 30, 60, 120 })
             {
                 var s = Match();
-                s.Foe.Position = new Vector3(-20f,0,0);
+                s.Foe.Position = new Vector3(-(GameConfig.ZoneCircleRadius + 5f), 0f, 0f);
                 s.Local.Cooldowns[0] = 3.2f;
                 for (int i = 0; i < fps * 2; i++) s.Tick(1f / fps, Vector3.right * 0.4f);
                 if (fps == 30) { baseline = s.Local.Position; health = s.Foe.Health; cd = s.Local.Cooldowns[0]; }
@@ -260,18 +389,165 @@ namespace Arena.Tests
             Near(half.Local.Forward.magnitude, 1f);
         }
 
-        private static void Charge()
+        /// <summary>
+        /// Shield Throw is the Vanguard's ranged poke: the aegis itself flies out,
+        /// scores on the way there, turns around at the end of its run and homes
+        /// back to the hand it left — a second scoring chance on the way home,
+        /// and nothing left in the air afterwards.
+        /// </summary>
+        private static void ShieldThrow()
         {
             var s = Match();
-            s.Foe.Position = new Vector3(5f,0,0);
-            s.Foe.Velocity = Vector3.left * 100f;
-            Check(s.Cast(s.Local, 0), "Charge rejected");
-            s.Local.Velocity = Vector3.right * 600f;
-            s.Tick(GameConfig.FixedTimestep, Vector3.zero);
-            Near(s.Foe.Health, 91f);
-            s.Tick(GameConfig.FixedTimestep, Vector3.zero);
-            Near(s.Foe.Health, 91f);
-            Check(!s.Cast(s.Local, 0), "Cooldown not enforced");
+            var ab = s.Local.Def.Get(AbilitySlot.Primary);
+            Check(ab.Id == "shield_throw", "The Vanguard's first spell is not Shield Throw");
+            Check(ab.ProjectileRange > 0f, "Shield Throw must come back");
+
+            s.Local.Position = Vector3.zero;
+            s.Local.Forward = Vector3.right;
+            s.Foe.Velocity = Vector3.zero;
+            float health = s.Foe.Health;
+            Check(s.Cast(s.Local, (int)AbilitySlot.Primary), "Shield Throw rejected");
+            Check(!s.Cast(s.Local, (int)AbilitySlot.Primary), "Cooldown not enforced");
+            Check(Projectiles(s).Count == 1, "The shield never left the hand");
+
+            // A target that does not run is hit once going out and once coming
+            // back, and never a third time on either leg.
+            for (int i = 0; i < 180; i++)
+            {
+                s.Foe.Position = new Vector3(6f, 0f, 0f);
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(s.Foe.Health, health - 2f * ab.Damage);
+            Check(Projectiles(s).Count == 0, "The thrown shield never came home");
+
+            // Sideways is the dodge: the same throw against a target standing off
+            // the lane leaves them alone.
+            var aside = Match();
+            aside.Local.Position = Vector3.zero;
+            aside.Local.Forward = Vector3.right;
+            aside.Foe.Position = new Vector3(6f, 0f, 4f);
+            aside.Foe.Velocity = Vector3.zero;
+            float untouched = aside.Foe.Health;
+            aside.Cast(aside.Local, (int)AbilitySlot.Primary);
+            for (int i = 0; i < 180; i++)
+            {
+                aside.Foe.Position = new Vector3(6f, 0f, 4f);
+                aside.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(aside.Foe.Health, untouched);
+        }
+
+        /// <summary>
+        /// Dagger Throw is the assassin's poke: faster than the orb, but spent on
+        /// the fighter it hits — the knife has no way back.
+        /// </summary>
+        private static void DaggerThrow()
+        {
+            var s = Match(CharacterId.Assassin);
+            var ab = s.Local.Def.Get(AbilitySlot.Primary);
+            Check(ab.Id == "dagger_throw", "The assassin's first spell is not Dagger Throw");
+            Check(ab.ProjectileSpeed > GameConfig.OrbSpeed, "A dagger must outrun an orb");
+
+            s.Local.Position = Vector3.zero;
+            s.Local.Forward = Vector3.right;
+            s.Foe.Position = new Vector3(5f, 0f, 0f);
+            s.Foe.Velocity = Vector3.zero;
+            float health = s.Foe.Health;
+            Check(s.Cast(s.Local, (int)AbilitySlot.Primary), "Dagger rejected");
+            Check(!s.Cast(s.Local, (int)AbilitySlot.Primary), "Cooldown not enforced");
+            Check(Projectiles(s).Count == 1, "The dagger never left the hand");
+            for (int i = 0; i < 60; i++) s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Near(s.Foe.Health, health - ab.Damage);
+            Check(Projectiles(s).Count == 0, "The dagger should be spent on its hit");
+        }
+
+        /// <summary>
+        /// Shadowstep trades the ice for grip: for its three seconds the assassin
+        /// tracks the stick and holds a speed nobody else reaches, so he stops and
+        /// turns on a coin — and when the timer runs out the ice comes back.
+        /// </summary>
+        private static void Shadowstep()
+        {
+            var plain = Match(CharacterId.Storm);
+            var hasted = Match(CharacterId.Assassin);
+            var ab = hasted.Local.Def.Get(AbilitySlot.Secondary);
+            Check(ab.Id == "shadowstep", "The assassin's second spell is not Shadowstep");
+
+            Check(hasted.Cast(hasted.Local, (int)AbilitySlot.Secondary), "Shadowstep rejected");
+            Check(!hasted.Cast(hasted.Local, (int)AbilitySlot.Secondary),
+                "Shadowstep recast ignored cooldown");
+            Near(hasted.Local.Haste, ab.BuffDuration);
+
+            // Both fighters run the same lane for a second and reach their own
+            // top speed: the buff's is the higher one.
+            for (int i = 0; i < 60; i++)
+            {
+                plain.Tick(GameConfig.FixedTimestep, Vector3.left);
+                hasted.Tick(GameConfig.FixedTimestep, Vector3.left);
+            }
+            float iceSpeed = plain.Local.Velocity.magnitude;
+            Near(hasted.Local.Velocity.magnitude, ab.BuffSpeed, 0.5f);
+            Check(hasted.Local.Velocity.magnitude > iceSpeed * 1.25f,
+                $"Shadowstep is no faster ({hasted.Local.Velocity.magnitude:0.00} vs {iceSpeed:0.00})");
+
+            // Let go: the ice carries the mage on, the buff stops the assassin.
+            for (int i = 0; i < 12; i++)
+            {
+                plain.Tick(GameConfig.FixedTimestep, Vector3.zero);
+                hasted.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Check(hasted.Local.Velocity.magnitude < ab.BuffSpeed * 0.2f,
+                "The buff slides like the ice: " + hasted.Local.Velocity.magnitude);
+            Check(plain.Local.Velocity.magnitude > iceSpeed * 0.7f,
+                "The ice stopped sliding for everyone: " + plain.Local.Velocity.magnitude);
+
+            // The whole point: it ends. Three seconds after the cast the fighter
+            // is back on the ice, top speed and all.
+            hasted.Local.Position = Vector3.zero;
+            for (int i = 0; i < 240; i++) hasted.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Near(hasted.Local.Haste, 0f);
+            for (int i = 0; i < 60; i++) hasted.Tick(GameConfig.FixedTimestep, Vector3.left);
+            Check(hasted.Local.Velocity.magnitude < ab.BuffSpeed,
+                "The buff outlived its own timer: " + hasted.Local.Velocity.magnitude);
+            for (int i = 0; i < 12; i++) hasted.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(hasted.Local.Velocity.magnitude > iceSpeed * 0.7f,
+                "The ice never came back after Shadowstep: " + hasted.Local.Velocity.magnitude);
+        }
+
+        /// <summary>
+        /// Blade Wave is the assassin's ultimate: a whole fan of blades at once,
+        /// thrown wide enough to catch a target who dodges sideways — but a
+        /// fighter standing inside the fan is charged by one blade, not seven.
+        /// </summary>
+        private static void BladeWave()
+        {
+            var ab = GameConfig.Assassin.Get(AbilitySlot.Ultimate);
+            Check(ab.Id == "blade_wave" && ab.FanCount > 1 && ab.FanSpread > 0f,
+                "The assassin's ultimate is not a wave of blades");
+
+            var s = Match(CharacterId.Assassin);
+            s.Local.Position = Vector3.zero;
+            s.Local.Forward = Vector3.right;
+            s.Foe.Position = new Vector3(6f, 0f, 0f);
+            s.Foe.Velocity = Vector3.zero;
+            float health = s.Foe.Health;
+            Check(s.Cast(s.Local, (int)AbilitySlot.Ultimate), "Blade Wave rejected");
+            Check(Projectiles(s).Count == ab.FanCount,
+                $"The wave threw {Projectiles(s).Count} of {ab.FanCount} blades");
+
+            // The fan is a fan: most blades are heading off the aim line.
+            int fanned = 0;
+            foreach (var blade in Projectiles(s))
+                if (Mathf.Abs(ProjectileVelocity(blade).z) > 1f) fanned++;
+            Check(fanned >= ab.FanCount - 1, "The wave came out as a single line: " + fanned);
+
+            for (int i = 0; i < 90; i++)
+            {
+                s.Foe.Position = new Vector3(6f, 0f, 0f);
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(s.Foe.Health, health - ab.Damage);
+            Check(Projectiles(s).Count == 0, "The wave did not clear");
         }
 
         private static void Orb()
@@ -291,14 +567,14 @@ namespace Arena.Tests
         private static void OrbWall()
         {
             var s = Match(CharacterId.Storm);
-            s.Local.Position = new Vector3(14.5f,0,0);
-            s.Foe.Position = new Vector3(15.5f,0,0);
+            s.Local.Position = new Vector3(GameConfig.PlayLimit - 0.1f, 0f, 0f);
+            s.Foe.Position = new Vector3(GameConfig.PlayLimit + 0.9f, 0f, 0f);
             s.Cast(s.Local, 0);
             s.Tick(GameConfig.FixedTimestep, Vector3.zero);
             Near(s.Foe.Health, 100f - GameConfig.ZoneDamagePerSecond * GameConfig.FixedTimestep);
             // Also test an orb crossing the boundary from inside over several steps.
             var inside = Match(CharacterId.Storm);
-            inside.Local.Position = new Vector3(13f, 0, 0);
+            inside.Local.Position = new Vector3(GameConfig.PlayLimit - 1.6f, 0, 0);
             inside.Foe.Position = new Vector3(-10f, 0, 0);
             inside.Cast(inside.Local, 0);
             for (int i = 0; i < 10; i++) inside.Tick(GameConfig.FixedTimestep, Vector3.zero);
@@ -320,28 +596,202 @@ namespace Arena.Tests
             Check(s.Local.Invulnerable > 0f, "Blink lost invulnerability");
         }
 
+        /// <summary>
+        /// The Earthrift is a corridor, not a circle: a fighter standing in the
+        /// line eats the hit, while one past its end or off to the side does not.
+        /// </summary>
         private static void Area()
         {
-            foreach (int slot in new[] { 1, 2 })
+            var ab = GameConfig.Vanguard.Get(AbilitySlot.Ultimate);
+            Check(ab.Telegraph > 0f, "The Earthrift must telegraph its line");
+            int warningSteps = Mathf.CeilToInt(ab.Telegraph / GameConfig.FixedTimestep) + 10;
+
+            // Nothing lands while the warning is on the ground, so a fighter in
+            // the corridor still has time to walk out of it.
+            var inside = Match();
+            inside.Foe.Position = Vector3.right * (ab.Range - 0.1f);
+            Check(inside.Cast(inside.Local, (int)AbilitySlot.Ultimate), "Rift cast rejected");
+            inside.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Near(inside.Foe.Health, 100f);
+            Check(!inside.Cast(inside.Local, (int)AbilitySlot.Ultimate), "Area recast ignored cooldown");
+
+            // Stay in the line and the rift opens under you.
+            for (int i = 0; i < warningSteps; i++)
             {
-                var s = Match(); var ab = s.Local.Def.Get((AbilitySlot)slot);
-                s.Foe.Position = Vector3.right * (ab.Range - 0.1f);
-                Check(s.Cast(s.Local, slot), "Area cast rejected"); Near(s.Foe.Health, 100f - ab.Damage);
-                Check(!s.Cast(s.Local, slot), "Area recast ignored cooldown");
-                var far = Match(); far.Foe.Position = Vector3.right * (ab.Range + 0.1f);
-                far.Cast(far.Local, slot); Near(far.Foe.Health, 100f);
+                inside.Foe.Position = Vector3.right * (ab.Range - 0.1f);
+                inside.Foe.Velocity = Vector3.zero;
+                inside.Tick(GameConfig.FixedTimestep, Vector3.zero);
             }
+            Near(inside.Foe.Health, 100f - ab.Damage);
+
+            // Step out of the corridor during the warning and it misses entirely.
+            var dodge = Match();
+            dodge.Foe.Position = Vector3.right * (ab.Range * 0.5f);
+            dodge.Cast(dodge.Local, (int)AbilitySlot.Ultimate);
+            for (int i = 0; i < warningSteps; i++)
+            {
+                dodge.Foe.Position = Vector3.right * (ab.Range + 4f);
+                dodge.Foe.Velocity = Vector3.zero;
+                dodge.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(dodge.Foe.Health, 100f);
+
+            // Past the end of the corridor: out of reach.
+            var past = Match();
+            past.Foe.Position = Vector3.right * (ab.Range + 2f);
+            past.Cast(past.Local, (int)AbilitySlot.Ultimate);
+            for (int i = 0; i < warningSteps; i++)
+            {
+                past.Foe.Position = Vector3.right * (ab.Range + 2f);
+                past.Foe.Velocity = Vector3.zero;
+                past.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(past.Foe.Health, 100f);
+
+            // Well to the side of the corridor: also out of reach.
+            var beside = Match();
+            beside.Foe.Position = new Vector3(ab.Range * 0.5f, 0f, ab.RiftWidth + 1.5f);
+            beside.Cast(beside.Local, (int)AbilitySlot.Ultimate);
+            for (int i = 0; i < warningSteps; i++)
+            {
+                beside.Foe.Position = new Vector3(ab.Range * 0.5f, 0f, ab.RiftWidth + 1.5f);
+                beside.Foe.Velocity = Vector3.zero;
+                beside.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(beside.Foe.Health, 100f);
+        }
+
+        /// <summary>
+        /// The Frost Aegis soaks incoming damage before health — spells and zone
+        /// pressure alike — replicates that state to the guest, and drops on its
+        /// own when the timer runs out.
+        /// </summary>
+        private static void Aegis()
+        {
+            var s = Match();
+            var ab = GameConfig.Vanguard.Get(AbilitySlot.Secondary);
+            Check(s.Cast(s.Local, (int)AbilitySlot.Secondary), "Aegis rejected");
+            Near(s.Local.Shield, ab.ShieldAmount);
+            Check(!s.Cast(s.Local, (int)AbilitySlot.Secondary), "Aegis recast ignored cooldown");
+
+            // A spell hit is absorbed: Storm's vortex bursts for 10 where its
+            // throw ends, and health must not move while the shield holds.
+            var v = Match();
+            v.Cast(v.Local, (int)AbilitySlot.Secondary);
+            var vortex = GameConfig.Storm.Get(AbilitySlot.Ultimate);
+            v.Cast(v.Foe, (int)AbilitySlot.Ultimate);
+            // The vortex is thrown down its line from the caster, so the victim
+            // has to sit where the throw ends to eat the burst.
+            var burstSpot = new Vector3(2f, 0f, 0f);
+            // Three seconds: past the ground warning and the throw down the line.
+            for (int i = 0; i < 190; i++)
+            {
+                v.Local.Position = burstSpot;
+                v.Local.Velocity = Vector3.zero;
+                v.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(v.Local.Health, 100f);
+            Near(v.Local.Shield, ab.ShieldAmount - vortex.Damage);
+
+            // Zone pressure goes through the shield as well.
+            var z = Match();
+            z.Cast(z.Local, (int)AbilitySlot.Secondary);
+            for (int i = 0; i < 30; i++)
+            {
+                z.Local.Position = new Vector3(GameConfig.ZoneCircleRadius + 4f, 0f, 0f);
+                z.Local.Velocity = Vector3.zero;
+                z.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(z.Local.Health, 100f);
+            Check(z.Local.Shield < ab.ShieldAmount, "Zone ignored the shield");
+
+            // The guest rebuilds the shield from the host snapshot.
+            var guest = Match();
+            var state = JsonUtility.FromJson<MatchSnapshot>(
+                JsonUtility.ToJson(s.CaptureSnapshot()));
+            guest.ApplySnapshot(state);
+            Near(guest.Local.Shield, s.Local.Shield);
+            Near(guest.Local.Shield, ab.ShieldAmount);
+
+            // And the shield drops on its own when its timer runs out.
+            var e = Match();
+            e.Cast(e.Local, (int)AbilitySlot.Secondary);
+            for (int i = 0; i < 250; i++) e.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Near(e.Local.Shield, 0f);
         }
 
         private static void Vortex()
         {
-            var s = Match(CharacterId.Storm); s.Foe.Position = new Vector3(5f,0,0);
-            s.Cast(s.Local, 2); s.Tick(GameConfig.FixedTimestep, Vector3.zero);
-            Check(s.Foe.Velocity.x < 0f, "Vortex did not pull");
-            // Keep target in the burst without letting body contact move it away.
-            for (int i = 0; i < 110; i++)
-            { s.Foe.Position = new Vector3(5f,0,0); s.Foe.Velocity = Vector3.zero; s.Tick(GameConfig.FixedTimestep, Vector3.zero); }
-            Near(s.Foe.Health, 90f);
+            var ab = GameConfig.Storm.Get(AbilitySlot.Ultimate);
+            Check(ab.Telegraph > 0f, "The Vortex must telegraph its line");
+            var s = Match(CharacterId.Storm);
+            var target = new Vector3(8f, 0f, 0f);
+            s.Foe.Position = target;
+
+            // The warning comes first: nothing has been thrown and nobody is
+            // already being dragged, so the throw can be dodged.
+            s.Cast(s.Local, 2);
+            Check(Vortices(s).Count == 0, "Vortex landed before its warning finished");
+            // The wind-up is the funnel itself, gathering under the caster: the
+            // throw has to start where the player watched it form, so the spell
+            // is never "a marker somewhere out in the lane".
+            var warning = FirstWarning(s);
+            Check(warning != null &&
+                  (bool)AnyField(warning, "Charge").GetValue(warning) &&
+                  (Transform)AnyField(warning, "Root").GetValue(warning) != null,
+                "The vortex wind-up is not a funnel gathering under the caster");
+            var gathering = (Transform)AnyField(warning, "Root").GetValue(warning);
+            Check((gathering.position - s.Local.Position).magnitude < 1f,
+                "The vortex funnel gathered away from the caster (at " +
+                gathering.position + ", caster at " + s.Local.Position + ")");
+            s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Near(s.Foe.Health, 100f);
+            Near(s.Foe.Velocity.x, 0f);
+
+            // Then it is thrown down the line, not dropped at the caster's feet.
+            for (int i = 0; i < 60; i++)
+            {
+                s.Foe.Position = target;
+                s.Foe.Velocity = Vector3.zero;
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            var hazard = FirstVortex(s);
+            Check(hazard != null, "Vortex never appeared after its warning");
+            var centre = (Vector3)AnyField(hazard, "Centre").GetValue(hazard);
+            Check(centre.x > 1f, "Vortex was dropped on the ground it was cast from");
+
+            // The pull travels with it: standing nearer the thrower is dragged
+            // out along the line, the way the spell reads on screen.
+            s.Foe.Position = target;
+            s.Foe.Velocity = Vector3.zero;
+            s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(s.Foe.Velocity.x > 0f, "The thrown vortex does not drag its victim (vx=" +
+                s.Foe.Velocity.x + ", centre.x=" + centre.x + ", target.x=" + s.Foe.Position.x +
+                ", line=" + ab.LineLength + ", life=" + ab.HazardLifetime + ")");
+
+            // Contact hurts while it travels: the swept fighter is already wounded
+            // mid-throw, not only when the vortex runs out of line at the end.
+            Near(s.Foe.Health, 100f - ab.Damage);
+
+            // The funnel rides the hazard. It used to be built once when the spell
+            // was cast and then only animated in place, so the tornado sat at the
+            // caster's feet while the pull and the burst happened down the line.
+            var funnel = (GameObject)AnyField(hazard, "Go").GetValue(hazard);
+            var live = (Vector3)AnyField(hazard, "Centre").GetValue(hazard);
+            Check(funnel != null && (funnel.transform.position - live).magnitude < 1f,
+                "The vortex funnel did not travel with the hazard (funnel=" +
+                (funnel != null ? funnel.transform.position.ToString() : "null") +
+                ", hazard=" + live + ")");
+
+            // The end of the line still bursts, but the fighter that was already
+            // swept is not charged for the same throw twice.
+            for (int i = 0; i < 150; i++)
+            {
+                s.Foe.Position = target;
+                s.Foe.Velocity = Vector3.zero;
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Near(s.Foe.Health, 100f - ab.Damage);
         }
 
         private static void Overlap()
@@ -458,6 +908,153 @@ namespace Arena.Tests
             Check(!sim.Cast(sim.Foe, 0), "Remote cooldown not enforced");
         }
 
+        /// <summary>
+        /// The lobby roster is the leader's join screen: bots fill slots, open
+        /// slots wait for a human, closed slots stay out of the match, and only
+        /// the leader may hand out or take back a seat.
+        /// </summary>
+        private static void Lobby()
+        {
+            var roster = new LobbyRoster(LobbyRoster.MaxSlots, CharacterId.Vanguard);
+            Check(roster.PlayerCount == 1 && roster.BotCount == 0, "Leader missing from a new lobby");
+            Check(!roster.CanStart, "A one-player lobby must not be startable");
+            Near(roster.FirstOpenSlot, -1);   // every other slot starts closed
+
+            // Quick setup: bots fill 1..n with cycling characters, rest stays closed.
+            roster.SetBotCount(3, CharacterId.Vanguard);
+            Check(roster.BotCount == 3 && roster.ParticipantCount == 4, "Bot fill wrong");
+            Check(roster[1].Character == CharacterId.Vanguard, "First bot character wrong");
+            Check(roster[2].Character == CharacterId.Storm, "Bot characters must cycle");
+            Check(roster[3].Character == CharacterId.Assassin, "The cycle skipped a class");
+            Check(LobbyRoster.CycleCharacter(CharacterId.Vanguard, 3) == CharacterId.Vanguard,
+                "Cycle did not wrap");
+            Check(roster[4].State == SlotState.Closed, "Slots past the bots must stay closed");
+            Check(roster.CanStart, "Four participants must be startable");
+
+            // A human takes the lowest open seat, and the leader is safe from kicks.
+            Check(roster.Open(4) && roster[4].State == SlotState.Open, "Open failed");
+            Check(roster.Join("Guest", CharacterId.Storm) == 4, "Join must take the first open slot");
+            Check(roster[4].State == SlotState.Player && roster.PlayerCount == 2, "Join state wrong");
+            Check(!roster.Kick(LobbyRoster.LeaderIndex), "The leader must not be kickable");
+            Check(roster.Kick(4) && roster[4].State == SlotState.Open, "Kick must free the slot");
+            Check(!roster.Kick(4), "A free slot is not a player to kick");
+            Check(roster.Join("Second", CharacterId.Vanguard) == 4, "Rejoin slot wrong");
+            Check(roster.Leave(4) && roster[4].State == SlotState.Open, "Leave must free the slot");
+
+            // Bots come and go without evicting the humans already seated.
+            Check(roster.AddBot(CharacterId.Storm) && roster.BotCount == 4, "AddBot wrong");
+            Check(roster.RemoveBot() && roster.BotCount == 3, "RemoveBot wrong");
+            Check(roster.Close(5) && roster[5].State == SlotState.Closed, "Close wrong");
+            Check(!roster.Close(LobbyRoster.LeaderIndex), "The leader slot must stay seated");
+            Check(roster.RemoveBot() && roster.RemoveBot() && roster.RemoveBot(), "Bots did not drain");
+            Check(!roster.RemoveBot(), "There was no bot left to remove");
+            Check(roster.ParticipantCount == 1 && !roster.CanStart, "An empty lobby must not start");
+
+            // A full lobby turns players away instead of stacking them.
+            var full = new LobbyRoster(4, CharacterId.Vanguard);
+            full.SetBotCount(3, CharacterId.Storm);
+            Near(full.FirstOpenSlot, -1);
+            Near(full.Join("Late", CharacterId.Storm), -1);
+
+            // Cycling reaches every class rather than repeating one.
+            var seen = new HashSet<CharacterId>();
+            for (int i = 0; i < 6; i++) seen.Add(LobbyRoster.CycleCharacter(CharacterId.Storm, i));
+            Check(seen.Count == System.Enum.GetValues(typeof(CharacterId)).Length,
+                "Character cycle never reaches every class");
+        }
+
+        /// <summary>
+        /// Free-for-all: more than two fighters share one arena, everyone can be
+        /// hit by everyone, and the match is decided by who is left standing.
+        /// </summary>
+        /// <summary>
+        /// The flow the game opens with: three mode tiles, then the fighter
+        /// picker for the mode that was chosen, and the match with its countdown
+        /// as soon as START is pressed.
+        /// </summary>
+        private static void Flow()
+        {
+            var bootstrap = UnityEngine.Object.FindAnyObjectByType<GameBootstrap>();
+            Invoke(bootstrap, "ReturnToMenu");
+            var modes = (ModeSelectView)Field(bootstrap, "modes").GetValue(bootstrap);
+            var picker = (CharacterSelectView)Field(bootstrap, "signup").GetValue(bootstrap);
+            Check(modes.gameObject.activeSelf && !picker.gameObject.activeSelf,
+                "The mode tiles must be the first thing the player sees");
+            foreach (var tile in new[] { "Tile_Campaign", "Tile_Bots", "Tile_Lan" })
+                Check(modes.transform.Find("ModeContent/" + tile) != null, "Missing mode tile " + tile);
+
+            // A mode opens the picker, and the picker is only UI: no arena, no
+            // practice sim, no clock running against the player.
+            modes.transform.Find("ModeContent/Tile_Campaign").GetComponent<Button>().onClick.Invoke();
+            Check(Field(bootstrap, "mode").GetValue(bootstrap).ToString() == "Campaign",
+                "The tile click never reached the bootstrap");
+            Check(picker.gameObject.activeSelf && !modes.gameObject.activeSelf,
+                "A mode tile did not open the fighter picker (picker=" + picker.gameObject.activeSelf +
+                ", modes=" + modes.gameObject.activeSelf + ", phase=" +
+                Field(bootstrap, "phase").GetValue(bootstrap) + ")");
+            Check(Field(bootstrap, "phase").GetValue(bootstrap).ToString() == "Select",
+                "The picker phase was not entered");
+            Check(Field(bootstrap, "sim").GetValue(bootstrap) == null,
+                "The picker must not be simulating a match");
+            foreach (var id in (CharacterId[])System.Enum.GetValues(typeof(CharacterId)))
+                Check(picker.transform.Find("SelectContent/CardRow/Card_" + id) != null,
+                    "The picker does not offer " + id);
+            Check(picker.transform.Find("SelectContent/Options/Seg_ZONE/Seg/Opt1") != null,
+                "The picker lost the zone row");
+
+            // Picking a fighter and starting hands over to the real match, and
+            // the fighter that was picked is the one that spawns.
+            picker.transform.Find("SelectContent/CardRow/Card_Storm").GetComponent<Button>().onClick.Invoke();
+            Check(picker.Character == CharacterId.Storm, "Tapping a card did not select that fighter");
+            picker.transform.Find("SelectContent/Actions/Action_START").GetComponent<Button>().onClick.Invoke();
+            Check(Field(bootstrap, "phase").GetValue(bootstrap).ToString() == "Countdown",
+                "START did not begin the match");
+            Near((float)Field(bootstrap, "timer").GetValue(bootstrap), GameConfig.CountdownSeconds, 0.01f);
+            var sim = (MatchSim)Field(bootstrap, "sim").GetValue(bootstrap);
+            Check(sim != null && sim.Local.Def.Id == CharacterId.Storm,
+                "The match did not use the fighter that was picked");
+            Check(sim.Foe.Def.Id != sim.Local.Def.Id, "The opponent must be a different class");
+            Check(sim.Fighters.Count == 2, "One opponent was asked for, so the match has two fighters");
+            Invoke(bootstrap, "ReturnToMenu");
+            Check(modes.gameObject.activeSelf && !picker.gameObject.activeSelf,
+                "ReturnToMenu did not restore the mode tiles");
+        }
+
+        private static void FreeForAll()
+        {
+            var sim = Match(CharacterId.Vanguard, true, 2);      // player + three bots
+            Check(sim.Fighters.Count == 4, "Free-for-all dropped fighters");
+            Check(sim.Local == sim.Fighters[0] && sim.Foe == sim.Fighters[1], "Slot order wrong");
+            Check(sim.AliveCount == 4 && !sim.MatchOver, "A four-way match must start live");
+
+            for (int i = 0; i < 120; i++) sim.Tick(GameConfig.FixedTimestep, Vector3.right * 0.3f);
+            foreach (var fighter in sim.Fighters)
+            {
+                Check(!float.IsNaN(fighter.Position.x) && !float.IsNaN(fighter.Health),
+                    "Free-for-all produced NaN");
+                float reach = new Vector2(fighter.Position.x, fighter.Position.z).magnitude
+                    + GameConfig.PlayerRadius;
+                Check(reach <= GameConfig.SpectatorInnerRadius,
+                    $"A free-for-all fighter left the sand at {reach}");
+            }
+
+            // Reset the scoreboard so the knockout below is deterministic, then
+            // leave exactly one fighter standing.
+            foreach (var fighter in sim.Fighters)
+            {
+                fighter.Health = GameConfig.MaxHealth;
+                fighter.Dead = false;
+            }
+            for (int i = 1; i < sim.Fighters.Count; i++)
+            {
+                sim.Fighters[i].Health = 0f;
+                sim.Fighters[i].Dead = true;
+            }
+            Check(sim.AliveCount == 1 && sim.MatchOver, "Last fighter standing not detected");
+            Check(sim.LastAlive == sim.Local, "The survivor must be the one still alive");
+            Check(sim.Foe.Dead, "A knocked-out fighter must read as dead");
+        }
+
         private static void Snapshots()
         {
             var host = Match(CharacterId.Storm); var guest = Match(CharacterId.Storm);
@@ -552,19 +1149,29 @@ namespace Arena.Tests
         {
             var bootstrap = UnityEngine.Object.FindAnyObjectByType<GameBootstrap>();
             Invoke(bootstrap, "ReturnToMenu");
-            var menu = (MainMenuView)Field(bootstrap, "menu").GetValue(bootstrap);
-            Button ButtonAt(string path) => menu.transform.Find("MenuContent/" + path).GetComponent<Button>();
-            ButtonAt("Seg_GAME MODE/Seg/Opt1").onClick.Invoke();
-            ButtonAt("StartWrap/Action_START BATTLE").onClick.Invoke();
+            var modes = (ModeSelectView)Field(bootstrap, "modes").GetValue(bootstrap);
+            var picker = (CharacterSelectView)Field(bootstrap, "signup").GetValue(bootstrap);
+            Button ButtonAt(string path) => picker.transform.Find("SelectContent/" + path).GetComponent<Button>();
+            // The three mode tiles are the first screen; the network tile opens
+            // the picker, which owns host/join, the zone and the action.
+            modes.transform.Find("ModeContent/Tile_Lan").GetComponent<Button>().onClick.Invoke();
+            Check(picker.gameObject.activeSelf && !modes.gameObject.activeSelf,
+                "The network tile did not open the fighter picker (picker=" + picker.gameObject.activeSelf +
+                ", modes=" + modes.gameObject.activeSelf + ", phase=" +
+                Field(bootstrap, "phase").GetValue(bootstrap) + ", mode=" +
+                Field(bootstrap, "mode").GetValue(bootstrap) + ")");
+            ButtonAt("Actions/Action_START").onClick.Invoke();
             var host = (LanSession)Field(bootstrap, "network").GetValue(bootstrap);
             Check(host != null && host.IsHost, "Host UI did not create listener (mode=" +
-                Field(menu, "mode").GetValue(menu) + " busy=" + Field(menu, "busy").GetValue(menu) + ")");
+                Field(bootstrap, "mode").GetValue(bootstrap) + ")");
             // The zone picker stays live while the host waits, and its choice
             // must survive until the guest joins (it used to be silently lost).
-            var zoneSquare = ButtonAt("Seg_ZONE SHAPE/Seg/Opt1");
+            var zoneSquare = ButtonAt("Options/Seg_ZONE/Seg/Opt1");
             Check(zoneSquare.interactable, "Zone picker locked while the host waits");
+            ButtonAt("Options/Seg_ZONE/Seg/Opt0").onClick.Invoke();
+            Check(picker.Zone == ZoneShape.Circle, "Zone tap ignored while the host waits");
             zoneSquare.onClick.Invoke();
-            Check(menu.Zone == ZoneShape.Square, "Zone tap ignored while waiting");
+            Check(picker.Zone == ZoneShape.Square, "Zone picker lost the waiting host's choice");
             using (var guest = LanSession.Join("127.0.0.1"))
             {
                 LanMessage state = null, welcome = null;
@@ -597,21 +1204,25 @@ namespace Arena.Tests
                 Check(state.phase == 1, "Host playing phase not replicated");
                 guest.Dispose();
                 Until(() => Field(bootstrap, "network").GetValue(bootstrap) == null, () => Invoke(bootstrap, "StepNetwork"));
-                Check(menu.gameObject.activeSelf, "Disconnect did not restore menu");
+                Check(modes.gameObject.activeSelf && !picker.gameObject.activeSelf,
+                    "Disconnect did not restore the mode screen");
             }
             // Join path uses the same input field and button that phone users touch.
             using (var remoteHost = LanSession.Host())
             {
-                ButtonAt("Seg_GAME MODE/Seg/Opt2").onClick.Invoke();
-                Check(!ButtonAt("Seg_ZONE SHAPE/Seg/Opt0").interactable,
+                modes.transform.Find("ModeContent/Tile_Lan").GetComponent<Button>().onClick.Invoke();
+                ButtonAt("Options/LanBox/Seg/Role/Seg/Opt1").onClick.Invoke();
+                Check(!ButtonAt("Options/Seg_ZONE/Seg/Opt0").interactable,
                     "Join phone still offers the zone the host decides");
-                var address = (TMPro.TMP_InputField)Field(menu, "hostAddress").GetValue(menu);
+                var address = (TMPro.TMP_InputField)Field(picker, "hostAddress").GetValue(picker);
                 address.text = "127.0.0.1";
-                ButtonAt("StartWrap/Action_START BATTLE").onClick.Invoke();
+                ButtonAt("Actions/Action_START").onClick.Invoke();
                 LanMessage hello = null;
                 remoteHost.Received += m => hello = m;
                 Action pump = () => { Invoke(bootstrap, "StepNetwork"); remoteHost.Pump(); };
                 Until(() => hello != null, pump);
+                Check(hello.kind == "hello" && hello.character == picker.Character,
+                    "Join did not announce the local fighter");
                 remoteHost.Send(new LanMessage { kind = "welcome", hostCharacter = CharacterId.Vanguard,
                     character = CharacterId.Storm, zone = ZoneShape.Square });
                 Until(() => (bool)Field(bootstrap, "handshake").GetValue(bootstrap), pump);

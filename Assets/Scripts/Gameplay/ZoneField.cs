@@ -29,13 +29,22 @@ namespace Arena.Gameplay
                    Mathf.Abs(p.z) > GameConfig.ZoneHalfHeight;
         }
 
-        /// <summary>Marks the fighter dead if its health runs out to the zone.</summary>
+        /// <summary>
+        /// Marks the fighter dead if its health runs out to the zone. A shield
+        /// soaks the pressure like any other damage, so the aegis is worth
+        /// casting on the way back in.
+        /// </summary>
         public void ApplyDamage(FighterSim f, float dt)
         {
             if (f.Dead || !IsOutside(f.Position)) return;
 
-            f.Health = Mathf.Max(0f, f.Health - GameConfig.ZoneDamagePerSecond * dt);
-            if (f.View != null) f.View.SetHealth(f.Health, GameConfig.MaxHealth);
+            float damage = GameConfig.ZoneDamagePerSecond * dt;
+            f.Health = Mathf.Max(0f, f.Health - CombatResolver.Absorb(f, damage));
+            if (f.View != null)
+            {
+                f.View.SetHealth(f.Health, GameConfig.MaxHealth);
+                f.View.SetShield(f.Shield, f.ShieldMax);
+            }
             if (f.Health <= 0f) f.Dead = true;
         }
     }

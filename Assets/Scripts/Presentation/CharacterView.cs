@@ -75,6 +75,14 @@ namespace Arena.Presentation
         private float hitFlash;
         private const float HitFlashSeconds = 0.22f;
 
+        // --- Frost Aegis bubble, built on first use ---
+        private Transform shield;
+
+        // --- Shadowstep aura, built on first use ---
+        private Transform hasteAura;
+        private float hasteLeft;
+        private float hasteMax;
+
         private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
         private static readonly int EmissionId = Shader.PropertyToID("_EmissionColor");
 
@@ -127,6 +135,8 @@ namespace Arena.Presentation
                     SetColor(r, def.ColorLight);
                 else if (n.StartsWith("Base"))
                     SetColor(r, def.Color * 0.55f);
+                else if (n.StartsWith("Shield"))
+                    continue;   // the bubble keeps its own translucent material
                 else if (n.StartsWith("Badge"))
                     SetColor(r, Color.white);
                 else if (n.StartsWith("Base"))
@@ -201,6 +211,107 @@ namespace Arena.Presentation
             lastMoveDir = worldDir.normalized;
         }
 
+        /// <summary>
+        /// Shows the Frost Aegis bubble around the body and sizes it with the
+        /// shield that is left. Built lazily and hidden at zero, so a fighter
+        /// that never shields pays nothing for it.
+        /// </summary>
+        public void SetShield(float remaining, float max)
+        {
+            if (remaining <= 0f || max <= 0f || def == null)
+            {
+                if (shield != null) shield.gameObject.SetActive(false);
+                return;
+            }
+
+            if (shield == null) shield = BuildShield();
+            shield.gameObject.SetActive(true);
+            float scale = Mathf.Lerp(1.02f, 1.55f, Mathf.Clamp01(remaining / max));
+            shield.localScale = new Vector3(scale, scale * 1.25f, scale);
+        }
+
+        /// <summary>
+        /// Called by gameplay while this fighter carries a grip/speed buff. The
+        /// aura under the feet is spun up by <see cref="AnimateHaste"/> from these
+        /// two numbers, so a guest driving its view from snapshots shows the same
+        /// ring the host does.
+        /// </summary>
+        public void SetHaste(float remaining, float max)
+        {
+            hasteLeft = Mathf.Max(0f, remaining);
+            hasteMax = Mathf.Max(0.01f, max);
+        }
+
+        /// <summary>
+        /// The buff's read: a ring of dashes orbiting the feet that tightens as
+        /// the timer runs out. Built lazily, so a fighter who never buffs pays
+        /// nothing for it.
+        /// </summary>
+        private void AnimateHaste()
+        {
+            if (hasteLeft <= 0f)
+            {
+                if (hasteAura != null) hasteAura.gameObject.SetActive(false);
+                return;
+            }
+
+            if (hasteAura == null) hasteAura = BuildHasteAura();
+            if (!hasteAura.gameObject.activeSelf) hasteAura.gameObject.SetActive(true);
+
+            float left = Mathf.Clamp01(hasteLeft / hasteMax);
+            float pulse = 0.9f + 0.1f * Mathf.Sin(Time.time * 24f);
+            float size = (0.8f + 0.4f * left) * pulse;
+            hasteAura.localScale = new Vector3(size, 1f, size);
+            hasteAura.Rotate(0f, 260f * Time.deltaTime, 0f, Space.Self);
+        }
+
+        private Transform BuildHasteAura()
+        {
+            var root = new GameObject("HasteAura");
+            root.transform.SetParent(transform, false);
+            root.transform.localPosition = new Vector3(0f, 0.03f, 0f);
+
+            Color tint = def.ColorLight;
+            var disc = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            DestroyComponent(disc.GetComponent<Collider>());
+            disc.name = "HasteDisc";
+            disc.transform.SetParent(root.transform, false);
+            disc.transform.localScale = new Vector3(2.0f, 0.02f, 2.0f);
+            OwnedMaterial.Assign(disc, OwnedMaterial.TransparentUnlit(
+                new Color(tint.r, tint.g, tint.b, 0.22f)));
+
+            // A cylinder is rotationally symmetric, so turning the disc shows
+            // nothing from overhead. Three dashes that orbit it do.
+            for (int i = 0; i < 3; i++)
+            {
+                float angle = i * (Mathf.PI * 2f / 3f);
+                var dash = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                DestroyComponent(dash.GetComponent<Collider>());
+                dash.name = "HasteDash";
+                dash.transform.SetParent(root.transform, false);
+                dash.transform.localPosition = new Vector3(
+                    Mathf.Sin(angle) * 0.80f, 0.04f, Mathf.Cos(angle) * 0.80f);
+                dash.transform.localRotation = Quaternion.Euler(0f, angle * Mathf.Rad2Deg, 0f);
+                dash.transform.localScale = new Vector3(0.15f, 0.05f, 0.66f);
+                OwnedMaterial.Assign(dash, OwnedMaterial.TransparentUnlit(
+                    new Color(tint.r, tint.g, tint.b, 0.55f)));
+            }
+            return root.transform;
+        }
+
+        private Transform BuildShield()
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            DestroyComponent(go.GetComponent<Collider>());
+            go.name = "ShieldBubble";
+            go.transform.SetParent(transform, false);
+            go.transform.localPosition = new Vector3(0f, 1.15f, 0f);
+            Color tint = def.ColorLight;
+            OwnedMaterial.Assign(go, OwnedMaterial.TransparentUnlit(
+                new Color(tint.r, tint.g, tint.b, 0.30f)));
+            return go.transform;
+        }
+
         public void SetVisible(bool visible)
         {
             foreach (var r in renderers)
@@ -226,6 +337,7 @@ namespace Arena.Presentation
                 bodyRoot.rotation = Quaternion.Slerp(bodyRoot.rotation, goal, 1f - Mathf.Exp(-turnSpeed * Time.deltaTime));
 
             AnimateBody();
+            AnimateHaste();
 
             if (bodyRoot != null)
             {
@@ -244,7 +356,7 @@ namespace Arena.Presentation
                 {
                     if (r == null) continue;
                     string n = r.gameObject.name;
-                    if (n.StartsWith("Head")) continue;
+                    if (n.StartsWith("Head") || n.StartsWith("Shield")) continue;
                     r.GetPropertyBlock(block);
                     Color baseCol = n.StartsWith("Crest") ? def.ColorLight
                         : n.StartsWith("Base") ? def.Color * 0.55f
@@ -404,6 +516,44 @@ namespace Arena.Presentation
                     new Vector3(0.64f, 1.40f, 0f), new Vector3(0.46f, 0.30f, 0.54f));
                 AddPart(body, PrimitiveType.Cube, "Plating",
                     new Vector3(0f, 1.06f, 0.36f), new Vector3(0.66f, 0.50f, 0.20f));
+            }
+            else if (def.Id == CharacterId.Assassin)
+            {
+                // Sleek and low: a hood, a crossed harness, a scarf trailing
+                // behind and a dagger on each hip. Parts whose names start with
+                // "Base" take the darkened half of the palette (see
+                // ApplyPalette), which is what keeps the blades reading bright.
+                AddPart(body, PrimitiveType.Cube, "BaseHood",
+                    new Vector3(0f, 1.88f, -0.02f), new Vector3(0.52f, 0.46f, 0.54f),
+                    new Vector3(0f, 45f, 45f));
+                AddPart(body, PrimitiveType.Cube, "BasePadL",
+                    new Vector3(-0.55f, 1.33f, 0f), new Vector3(0.30f, 0.19f, 0.40f),
+                    new Vector3(0f, 0f, 26f));
+                AddPart(body, PrimitiveType.Cube, "BasePadR",
+                    new Vector3(0.55f, 1.33f, 0f), new Vector3(0.30f, 0.19f, 0.40f),
+                    new Vector3(0f, 0f, -26f));
+                AddPart(body, PrimitiveType.Cube, "Sash",
+                    new Vector3(0f, 1.00f, 0.34f), new Vector3(0.66f, 0.12f, 0.20f),
+                    new Vector3(0f, 0f, -34f));
+                AddPart(body, PrimitiveType.Cube, "SashBack",
+                    new Vector3(0f, 1.00f, -0.34f), new Vector3(0.66f, 0.12f, 0.20f),
+                    new Vector3(0f, 0f, 34f));
+                AddPart(body, PrimitiveType.Cube, "BaseScarf",
+                    new Vector3(-0.30f, 1.36f, -0.40f), new Vector3(0.19f, 0.11f, 0.88f),
+                    new Vector3(20f, 0f, 0f));
+                AddPart(body, PrimitiveType.Cube, "BaseScarfTip",
+                    new Vector3(-0.30f, 1.20f, -0.84f), new Vector3(0.15f, 0.09f, 0.46f),
+                    new Vector3(38f, 0f, 0f));
+                AddPart(body, PrimitiveType.Cube, "BladeHipL",
+                    new Vector3(-0.33f, 0.60f, 0.22f), new Vector3(0.10f, 0.12f, 0.54f),
+                    new Vector3(30f, 0f, 0f));
+                AddPart(body, PrimitiveType.Cube, "BladeHipR",
+                    new Vector3(0.33f, 0.60f, 0.22f), new Vector3(0.10f, 0.12f, 0.54f),
+                    new Vector3(30f, 0f, 0f));
+                AddPart(body, PrimitiveType.Cube, "BaseBootL",
+                    new Vector3(-0.27f, 0.17f, 0.06f), new Vector3(0.33f, 0.21f, 0.46f));
+                AddPart(body, PrimitiveType.Cube, "BaseBootR",
+                    new Vector3(0.27f, 0.17f, 0.06f), new Vector3(0.33f, 0.21f, 0.46f));
             }
             else
             {

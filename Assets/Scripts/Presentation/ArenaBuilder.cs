@@ -53,6 +53,15 @@ namespace Arena.Presentation
 
         private float HalfWall => GameConfig.ArenaWidth * 0.5f; // 16
 
+        /// <summary>
+        /// How much bigger the field is than the original 32u square. Every prop
+        /// below was authored against that field, so laying them out through
+        /// <see cref="S"/> keeps the colosseum's composition intact whenever
+        /// <see cref="GameConfig.ArenaWidth"/> changes again.
+        /// </summary>
+        private static float Scale => GameConfig.ArenaWidth / 32f;
+        private static float S(float authoredAgainst32) => authoredAgainst32 * Scale;
+
         public ZoneShape Shape => shape;
 
         private void Awake() => Build();
@@ -122,9 +131,9 @@ namespace Arena.Presentation
         private void BuildBase()
         {
             Prim(PrimitiveType.Cylinder, "Plinth_Outer", geometry,
-                new Vector3(0f, -1.15f, 0f), new Vector3(62f, 0.25f, 62f), mDark);
+                new Vector3(0f, -1.15f, 0f), new Vector3(S(62f), 0.25f, S(62f)), mDark);
             Prim(PrimitiveType.Cylinder, "Plinth_Inner", geometry,
-                new Vector3(0f, -0.53f, 0f), new Vector3(54f, 0.45f, 54f), mStone);
+                new Vector3(0f, -0.53f, 0f), new Vector3(S(54f), 0.45f, S(54f)), mStone);
         }
 
         /// <summary>Square sand arena, top face flush with the sim plane (y = 0).</summary>
@@ -162,8 +171,8 @@ namespace Arena.Presentation
         private void BuildRuneCircle()
         {
             const int count = 28;
-            Ring("RuneOuter", 13.4f, count, 0.05f, 0.01f, 0.26f, mRune, 0.62f);
-            Ring("RuneInner", 12.6f, count, 0.05f, 0.01f, 0.18f, mArcane, 0.74f);
+            Ring("RuneOuter", S(13.4f), count, 0.05f, 0.01f, 0.26f, mRune, 0.62f);
+            Ring("RuneInner", S(12.6f), count, 0.05f, 0.01f, 0.18f, mArcane, 0.74f);
         }
 
         /// <summary>
@@ -197,7 +206,7 @@ namespace Arena.Presentation
             {
                 foreach (int sz in new[] { -1, 1 })
                 {
-                    float x = sx * 16.6f, z = sz * 16.6f;
+                    float x = sx * S(16.6f), z = sz * S(16.6f);
                     Prim(PrimitiveType.Cube, $"Tower_{sx}_{sz}", geometry,
                         new Vector3(x, 1.9f, z), new Vector3(2.0f, 3.8f, 2.0f), mStone);
                     Prim(PrimitiveType.Cube, $"TowerCap_{sx}_{sz}", geometry,
@@ -295,7 +304,7 @@ namespace Arena.Presentation
         /// <summary>Four obelisks just outside the wall, clear of the play area.</summary>
         private void BuildObelisks()
         {
-            const float d = 17.9f;
+            float d = S(17.9f);
             foreach (int sx in new[] { -1, 1 })
             {
                 foreach (int sz in new[] { -1, 1 })
@@ -319,8 +328,8 @@ namespace Arena.Presentation
         {
             var spots = new[]
             {
-                new Vector3(0f, 0f, 17.2f), new Vector3(0f, 0f, -17.2f),
-                new Vector3(17.2f, 0f, 0f), new Vector3(-17.2f, 0f, 0f)
+                new Vector3(0f, 0f, S(17.2f)), new Vector3(0f, 0f, -S(17.2f)),
+                new Vector3(S(17.2f), 0f, 0f), new Vector3(-S(17.2f), 0f, 0f)
             };
 
             for (int i = 0; i < spots.Length; i++)
@@ -343,7 +352,7 @@ namespace Arena.Presentation
             for (int i = 0; i < count; i++)
             {
                 float a = i / (float)count * Mathf.PI * 2f;
-                float radius = 19.5f + Mathf.Repeat(i * 1.7f, 4.5f);
+                float radius = S(19.5f) + Mathf.Repeat(i * 1.7f, S(4.5f));
                 float height = 3.4f + Mathf.Repeat(i * 2.3f, 3.2f);
                 float x = Mathf.Cos(a) * radius, z = Mathf.Sin(a) * radius;
 
@@ -360,14 +369,14 @@ namespace Arena.Presentation
         /// <summary>A translucent warded barrier standing on the parapet.</summary>
         private void BuildWard()
         {
-            Ring("Ward", 26.9f, 26, 7.2f, 4.45f, 0.22f, mWard, 0.30f);
-            Ring("WardRim", 26.9f, 26, 0.22f, 11.65f, 0.46f, mArcane, 0.12f);
+            Ring("Ward", S(26.9f), 26, 7.2f, 4.45f, 0.22f, mWard, 0.30f);
+            Ring("WardRim", S(26.9f), 26, 0.22f, 11.65f, 0.46f, mArcane, 0.12f);
         }
 
         private void BuildLights()
         {
-            AddPointLight("Light_Fire", new Vector3(0f, 4.2f, -17.2f), fireColor, 3.2f, 22f);
-            AddPointLight("Light_Arcane", new Vector3(0f, 5.0f, 17.2f), arcaneColor, 2.6f, 24f);
+            AddPointLight("Light_Fire", new Vector3(0f, 4.2f, -S(17.2f)), fireColor, 3.2f, 22f);
+            AddPointLight("Light_Arcane", new Vector3(0f, 5.0f, S(17.2f)), arcaneColor, 2.6f, 24f);
         }
 
         private void AddPointLight(string name, Vector3 pos, Color color, float intensity, float range)
@@ -388,7 +397,9 @@ namespace Arena.Presentation
         /// <summary>Ring of tangential slabs: cheap way to build a cylinder wall.</summary>
         private void Ring(string name, float radius, int segments, float height,
             float bottom, float thickness, Material material, float gap) =>
-            Ring(geometry, name, radius, segments, height, bottom, thickness, material, gap);
+            Ring(geometry, name, radius,
+                Mathf.Max(6, Mathf.RoundToInt(segments * Scale)),
+                height, bottom, thickness, material, gap);
 
         private void Ring(Transform parent, string name, float radius, int segments, float height,
             float bottom, float thickness, Material material, float gap)

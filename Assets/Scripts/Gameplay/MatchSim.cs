@@ -30,6 +30,25 @@ namespace Arena.Gameplay
 
         public readonly float[] Cooldowns = new float[3];
 
+        /// <summary>Damage the Frost Aegis can still soak; 0 when no shield is up.</summary>
+        public float Shield;
+        /// <summary>Amount the running shield started at, for the bubble's scale.</summary>
+        public float ShieldMax;
+        /// <summary>Seconds left on the shield; it drops when this runs out.</summary>
+        public float ShieldTimer;
+
+        // --- Shadowstep buff ---
+        /// <summary>
+        /// Seconds left of grip and speed. While it runs the ice is switched off
+        /// for this fighter: see <see cref="MatchSim.ApplyInput"/>.
+        /// </summary>
+        public float Haste;
+        /// <summary>What the buff started at, for the aura's read.</summary>
+        public float HasteMax;
+        /// <summary>Top speed the buff holds, and how hard it pulls there.</summary>
+        public float HasteSpeed;
+        public float HasteGrip;
+
         // --- bot brain scratch state ---
         public float DecisionTimer;
         public Vector3 DesiredDir;
@@ -57,7 +76,37 @@ namespace Arena.Gameplay
         private readonly ZoneField zone;
         private readonly FxSpawner fx = new FxSpawner();
 
+        /// <summary>
+        /// Every fighter in slot order: index 0 is the local player's, index 1 is
+        /// the one the LAN path mirrors (host↔guest), and anything from index 2 on
+        /// is an extra free-for-all opponent — today always a bot. The two
+        /// references above stay because the two-fighter match is the shape the
+        /// LAN protocol, the HUD and the regression tests are built on.
+        /// </summary>
+        private readonly List<FighterSim> all = new List<FighterSim>();
+
         private double accumulatedTime;
+
+        /// <summary>
+        /// Damage the world still owes: a line spell that has laid down its ground
+        /// warning but has not landed yet. The origin and direction are frozen at
+        /// cast time, so walking out of the corridor before the timer runs out is
+        /// exactly what dodging means.
+        /// </summary>
+        private readonly List<PendingStrike> pending = new List<PendingStrike>();
+
+        private sealed class PendingStrike
+        {
+            public FighterSim Caster;
+            public AbilityDef Ability;
+            public Vector3 Origin;
+            public Vector3 Forward;
+            public float Length;
+            public float Width;
+            public float Timer;
+            /// <summary>True for the Vortex: the impact throws a travelling hazard.</summary>
+            public bool Thrown;
+        }
 
         // Guest view smoothing. The guest has no prediction: it renders what
         // the host sent, so the view is eased from the snapshot that is on
@@ -73,7 +122,105 @@ namespace Arena.Gameplay
 
         public FighterSim Local => local;
         public FighterSim Foe => foe;
+        /// <summary>Slot-ordered roster: [0] local player, [1] first opponent, then the extras.</summary>
+        public IReadOnlyList<FighterSim> Fighters => all;
         public ZoneShape Zone => zone.Shape;
+
+        /// <summary>Fighters still standing, including the local player.</summary>
+        public int AliveCount
+        {
+            get
+            {
+                int alive = 0;
+                for (int i = 0; i < all.Count; i++) if (!all[i].Dead) alive++;
+                return alive;
+            }
+        }
+
+        /// <summary>The only fighter left standing, or null while the match is live.</summary>
+        public FighterSim LastAlive
+        {
+            get
+            {
+                if (AliveCount != 1) return null;
+                for (int i = 0; i < all.Count; i++) if (!all[i].Dead) return all[i];
+                return null;
+            }
+        }
+
+        /// <summary>A free-for-all is decided once one fighter (or nobody) is left.</summary>
+        public bool MatchOver => AliveCount <= 1;
+
+        /// <summary>
+        /// One fighter handed to the sim: which character, which view, and whether
+        /// the game drives it. The caller puts the local player first.
+        /// </summary>
+        public sealed class Setup
+        {
+            public CharacterDef Def;
+            public CharacterView View;
+            public bool IsBot;
+        }
+
+        /// <summary>
+        /// Full free-for-all. The first setup is the local player; everything after
+        /// the first opponent is placed around the arena and fights everyone.
+        /// </summary>
+        public MatchSim(IList<Setup> setups, ZoneShape zoneShape)
+            : this(setups[0].Def, setups[1].Def, setups[1].IsBot,
+                   setups[0].View, setups[1].View, zoneShape)
+        {
+            for (int i = 2; i < setups.Count; i++)
+            {
+                var extra = new FighterSim
+                {
+                    View = setups[i].View,
+                    Def = setups[i].Def,
+                    IsBot = setups[i].IsBot,
+                    Position = setups[i].View.transform.position
+                };
+                extra.Forward = FaceNearest(extra);
+                extra.View.SetFacing(extra.Forward);
+                all.Add(extra);
+            }
+
+            Debug.Log($"[MatchSim] free-for-all started with {all.Count} fighters " +
+                      $"({AliveCount} alive).");
+        }
+
+        /// <summary>Points a new fighter at whichever other fighter is closest.</summary>
+        private Vector3 FaceNearest(FighterSim fighter)
+        {
+            Vector3 best = Vector3.forward;
+            float bestDistance = float.MaxValue;
+            for (int i = 0; i < all.Count; i++)
+            {
+                Vector3 to = all[i].Position - fighter.Position;
+                to.y = 0f;
+                if (to.sqrMagnitude < 0.0001f) continue;
+                if (to.sqrMagnitude >= bestDistance) continue;
+                bestDistance = to.sqrMagnitude;
+                best = to.normalized;
+            }
+            return best;
+        }
+
+        /// <summary>The closest fighter that is not the one asking — the bot's target.</summary>
+        private FighterSim NearestOpponent(FighterSim fighter)
+        {
+            FighterSim best = null;
+            float bestDistance = float.MaxValue;
+            for (int i = 0; i < all.Count; i++)
+            {
+                var other = all[i];
+                if (other == fighter || other.Dead) continue;
+                float distance = CombatResolver.FlatDistance(fighter.Position, other.Position);
+                if (distance >= bestDistance) continue;
+                bestDistance = distance;
+                best = other;
+            }
+            return best;
+        }
 
         public MatchSim(CharacterDef localDef, CharacterDef foeDef, bool foeIsBot,
             CharacterView localView, CharacterView foeView, ZoneShape zoneShape)
@@ -97,6 +244,8 @@ namespace Arena.Gameplay
 
             // Face each other from the first frame so a point-blank charge
             // flies the right way even before anyone moves.
+            all.Add(local);
+            all.Add(foe);
             Vector3 opening = foe.Position - local.Position;
             opening.y = 0f;
             if (opening.sqrMagnitude > 0.0001f)
@@ -124,7 +273,7 @@ namespace Arena.Gameplay
             // Bound work per render frame, but retain backlog rather than deleting time.
             double step = GameConfig.FixedTimestep;
             while (accumulatedTime + 1e-8 >= step &&
-                   StepsLastTick < GameConfig.MaxCatchUpSteps && !local.Dead && !foe.Dead)
+                   StepsLastTick < GameConfig.MaxCatchUpSteps && AliveCount > 1)
             {
                 accumulatedTime = System.Math.Max(0d, accumulatedTime - step);
                 Step((float)step, localInputDir);
@@ -135,33 +284,66 @@ namespace Arena.Gameplay
         private void Step(float dt, Vector3 localInputDir)
         {
             if (foe.IsBot && !foe.Dead) BotBrain.Tick(foe, local, dt, zone, Cast);
+            // Every extra fighter is a bot in this build; each one hunts its own
+            // nearest living opponent instead of a fixed rival.
+            for (int i = 2; i < all.Count; i++)
+            {
+                var extra = all[i];
+                if (!extra.IsBot || extra.Dead) continue;
+                FighterSim hunt = NearestOpponent(extra);
+                if (hunt != null) BotBrain.Tick(extra, hunt, dt, zone, Cast);
+            }
             // Capture after casts (especially Blink): teleports are not swept attacks.
             local.PreviousPosition = local.Position;
             foe.PreviousPosition = foe.Position;
+            for (int i = 2; i < all.Count; i++) all[i].PreviousPosition = all[i].Position;
 
             ApplyInput(local, localInputDir, dt);
             ApplyInput(foe, foe.DesiredDir, dt);
+            for (int i = 2; i < all.Count; i++) ApplyInput(all[i], all[i].DesiredDir, dt);
 
             Integrate(local, dt);
             Integrate(foe, dt);
+            for (int i = 2; i < all.Count; i++) Integrate(all[i], dt);
 
             CombatResolver.ResolveCharge(local, foe);
             CombatResolver.ResolveCharge(foe, local);
             if (local.HitWall) local.ChargeTimer = 0f;
             if (foe.HitWall) foe.ChargeTimer = 0f;
+            // Charging and body contact are pairwise now: five fighters is ten
+            // pairs, still far cheaper than anything else in the step.
+            for (int i = 0; i < all.Count; i++)
+            {
+                var a = all[i];
+                for (int j = i + 1; j < all.Count; j++)
+                {
+                    var b = all[j];
+                    CombatResolver.ResolveCharge(a, b);
+                    CombatResolver.ResolveCharge(b, a);
+                }
+                if (a.HitWall) a.ChargeTimer = 0f;
+            }
 
-            fx.TickProjectiles(dt, local, foe);
-            fx.TickVortices(dt, local, foe);
-            CombatResolver.ResolveBodyContact(local, foe);
+            TickStrikes(dt);
+            fx.TickProjectiles(dt, all);
+            fx.TickVortices(dt, all);
+            for (int i = 0; i < all.Count; i++)
+                for (int j = i + 1; j < all.Count; j++)
+                    CombatResolver.ResolveBodyContact(all[i], all[j]);
 
             zone.ApplyDamage(local, dt);
             zone.ApplyDamage(foe, dt);
+            for (int i = 2; i < all.Count; i++) zone.ApplyDamage(all[i], dt);
+            fx.TickWarnings(dt);
             fx.TickRings(dt);
+            fx.TickRifts(dt);
             TickTimers(local, dt);
             TickTimers(foe, dt);
+            for (int i = 2; i < all.Count; i++) TickTimers(all[i], dt);
 
             local.View.transform.position = local.Position;
             foe.View.transform.position = foe.Position;
+            for (int i = 2; i < all.Count; i++) all[i].View.transform.position = all[i].Position;
         }
 
         private void TickTimers(FighterSim f, float dt)
@@ -169,6 +351,19 @@ namespace Arena.Gameplay
             if (f.Stun > 0f) f.Stun = Mathf.Max(0f, f.Stun - dt);
             if (f.Invulnerable > 0f) f.Invulnerable = Mathf.Max(0f, f.Invulnerable - dt);
             if (f.ChargeTimer > 0f) f.ChargeTimer = Mathf.Max(0f, f.ChargeTimer - dt);
+            if (f.Haste > 0f) f.Haste = Mathf.Max(0f, f.Haste - dt);
+            // Pushed every step, expiry included, so the view's aura is told when
+            // the buff is over instead of keeping the last live value forever.
+            if (f.View != null) f.View.SetHaste(f.Haste, f.HasteMax);
+            if (f.ShieldTimer > 0f)
+            {
+                f.ShieldTimer = Mathf.Max(0f, f.ShieldTimer - dt);
+                if (f.ShieldTimer <= 0f)
+                {
+                    f.Shield = 0f;
+                    if (f.View != null) f.View.SetShield(0f, 0f);
+                }
+            }
             for (int i = 0; i < f.Cooldowns.Length; i++)
                 if (f.Cooldowns[i] > 0f)
                     f.Cooldowns[i] = Mathf.Max(0f, f.Cooldowns[i] - dt);
@@ -177,15 +372,28 @@ namespace Arena.Gameplay
         private void ApplyInput(FighterSim f, Vector3 dir, float dt)
         {
             if (f.Dead || f.Stun > 0f) dir = Vector3.zero;
+            dir.y = 0f;
+            dir = Vector3.ClampMagnitude(dir, 1f);
 
             if (dir.sqrMagnitude > 0.0001f)
             {
-                dir.y = 0f;
-                dir = Vector3.ClampMagnitude(dir, 1f);
-                f.Velocity += dir * (GameConfig.Acceleration * dt);
                 f.Forward = dir.normalized;
                 f.View.SetFacing(dir);
             }
+
+            if (f.Haste > 0f)
+            {
+                // Shadowstep: no ice. Velocity is pulled onto the stick instead
+                // of accumulated and decayed, so he turns and stops on a coin and
+                // tops out faster than anyone else. A knockback is shrugged off
+                // with the same grip, which is the point of a three-second dive.
+                Vector3 desired = dir * f.HasteSpeed;
+                f.Velocity = Vector3.Lerp(f.Velocity, desired,
+                    1f - Mathf.Exp(-Mathf.Max(0.1f, f.HasteGrip) * dt));
+                return;
+            }
+
+            f.Velocity += dir * (GameConfig.Acceleration * dt);
 
             // Ice: exponential decay per 60Hz step, exactly like the prototype.
             float friction = Mathf.Pow(GameConfig.Friction, dt * 60f);
@@ -252,7 +460,8 @@ namespace Arena.Gameplay
             AbilityDef ab = caster.Def.Get((AbilitySlot)slot);
             caster.Cooldowns[slot] = ab.Cooldown;
 
-            FighterSim target = caster == local ? foe : local;
+            FighterSim target = NearestOpponent(caster);
+            if (target == null) return false;
             Vector3 fwd = caster.Forward.sqrMagnitude > 0.0001f
                 ? caster.Forward
                 : Vector3.forward;
@@ -271,8 +480,48 @@ namespace Arena.Gameplay
                     CombatResolver.TryHit(caster, target, ab, target.Position - caster.Position, ab.Range);
                     break;
 
+                case "dagger_throw":
                 case "thunder_orb":
+                case "shield_throw":
+                    // One thrown weapon, whatever its silhouette: the spawner reads
+                    // speed, life and shape off the ability, and turns the shield
+                    // around once it has flown its ProjectileRange.
                     fx.SpawnProjectile(caster, ab, fwd);
+                    break;
+
+                case "blade_wave":
+                    // The ultimate throws a whole fan at once; the volley shares
+                    // one hit list, so a fighter in the middle of it is struck by
+                    // one blade rather than seven.
+                    fx.SpawnBladeWave(caster, ab, fwd);
+                    break;
+
+                case "shadowstep":
+                {
+                    caster.Haste = ab.BuffDuration;
+                    caster.HasteMax = ab.BuffDuration;
+                    caster.HasteSpeed = ab.BuffSpeed > 0f
+                        ? ab.BuffSpeed : GameConfig.HasteTopSpeed;
+                    caster.HasteGrip = ab.BuffGrip > 0f ? ab.BuffGrip : GameConfig.HasteGrip;
+                    fx.SpawnRing(caster.Position, 2.4f, caster.Def.ColorLight);
+                    if (caster.View != null)
+                        caster.View.SetHaste(caster.Haste, caster.HasteMax);
+                    break;
+                }
+
+                case "frost_aegis":
+                    caster.Shield = ab.ShieldAmount;
+                    caster.ShieldMax = ab.ShieldAmount;
+                    caster.ShieldTimer = ab.ShieldDuration;
+                    fx.SpawnRing(caster.Position, 2.4f, caster.Def.ColorLight);
+                    if (caster.View != null)
+                        caster.View.SetShield(caster.Shield, caster.ShieldMax);
+                    break;
+
+                case "earthrift":
+                    // The crack opens after a ground warning, so whoever is standing
+                    // in the corridor still has time to step out of it.
+                    QueueStrike(caster, ab, fwd, false);
                     break;
 
                 case "blink":
@@ -288,7 +537,8 @@ namespace Arena.Gameplay
                 }
 
                 case "vortex":
-                    fx.SpawnVortex(caster, ab);
+                    // Thrown down a line instead of dropped at the caster's feet.
+                    QueueStrike(caster, ab, fwd, true);
                     break;
 
                 default:
@@ -300,6 +550,68 @@ namespace Arena.Gameplay
             Debug.Log($"[MatchSim] {caster.Def.DisplayName} cast '{ab.DisplayName}' " +
                       $"(slot={(AbilitySlot)slot})");
             return true;
+        }
+
+        /// <summary>
+        /// Lays down the warning a line spell gives before it lands. Nothing is
+        /// spawned here beyond the warning itself: the strike is resolved when its
+        /// timer runs out, against whoever is still standing in the corridor.
+        /// </summary>
+        private void QueueStrike(FighterSim caster, AbilityDef ab, Vector3 fwd, bool thrown)
+        {
+            float length = ab.LineLength > 0f ? ab.LineLength : ab.Range;
+            float halfWidth = thrown ? ab.HazardRadius * 0.5f : ab.RiftWidth;
+            // A thrown vortex is carried, not called down: the funnel gathers
+            // under the caster's feet and is thrown from there, so its telegraph
+            // is the wind-up itself rather than a corridor painted on the ground.
+            if (thrown)
+                fx.SpawnCharge(caster, ab.HazardRadius, caster.Def.Color, ab.Telegraph);
+            else
+                fx.SpawnWarning(caster.Position, fwd, length, halfWidth * 2f,
+                    caster.Def.Color, ab.Telegraph);
+            pending.Add(new PendingStrike
+            {
+                Caster = caster,
+                Ability = ab,
+                Origin = caster.Position,
+                Forward = fwd,
+                Length = length,
+                Width = halfWidth,
+                Timer = Mathf.Max(0.01f, ab.Telegraph),
+                Thrown = thrown
+            });
+        }
+
+        /// <summary>Resolves every telegraph whose warning has run out.</summary>
+        private void TickStrikes(float dt)
+        {
+            for (int i = pending.Count - 1; i >= 0; i--)
+            {
+                PendingStrike strike = pending[i];
+                strike.Timer -= dt;
+                if (strike.Timer > 0f) continue;
+
+                if (strike.Thrown)
+                {
+                    fx.SpawnVortex(strike.Caster, strike.Ability, strike.Forward, strike.Length);
+                }
+                else
+                {
+                    fx.SpawnRift(strike.Origin, strike.Forward, strike.Length, strike.Width,
+                        strike.Caster.Def.Color);
+                    // The corridor is the hit: everyone still inside it when the
+                    // ground opens takes the launch, not just the nearest fighter.
+                    for (int f = 0; f < all.Count; f++)
+                    {
+                        FighterSim victim = all[f];
+                        if (victim == strike.Caster || victim.Dead) continue;
+                        CombatResolver.TryLineHit(strike.Origin, victim, strike.Ability,
+                            strike.Forward, strike.Length, strike.Width);
+                    }
+                }
+
+                pending.RemoveAt(i);
+            }
         }
 
         /// <summary>Whether a world point falls outside the shrinking zone.</summary>
@@ -375,6 +687,7 @@ namespace Arena.Gameplay
             renderInterval = 1f / 60f;
             lastSnapshotAt = -1f;
             accumulatedTime = 0d;
+            pending.Clear();
             fx.Clear();
         }
 
