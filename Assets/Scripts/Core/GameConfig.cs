@@ -20,7 +20,7 @@ namespace Arena.Core
     public enum CharacterId
     {
         Vanguard,
-        Storm,
+        Mage,
         Assassin
     }
 
@@ -66,11 +66,11 @@ namespace Arena.Core
         // --- per-ability extras ---
         [Tooltip("Primary-only: dash impulse applied to the caster.")]
         public float DashImpulse;
-        [Tooltip("Secondary-only: blink distance for the Storm blink.")]
+        [Tooltip("Secondary-only: blink distance for the Mage's blink.")]
         public float BlinkDistance;
         [Tooltip("Secondary-only: i-frames granted after a blink.")]
         public float BlinkInvulnerability;
-        [Tooltip("Ultimate-only: lifetime of the Storm vortex hazard.")]
+        [Tooltip("Ultimate-only: lifetime of the Mage's vortex hazard.")]
         public float HazardLifetime;
         [Tooltip("Ultimate-only: radius of the vortex hazard pull.")]
         public float HazardRadius;
@@ -97,9 +97,9 @@ namespace Arena.Core
         public float ShieldAmount;
         [Tooltip("Aegis-only: seconds the shield lasts.")]
         public float ShieldDuration;
-        [Tooltip("Rift-only: width of the ground rift corridor.")]
-        public float RiftWidth;
-        [Tooltip("Seconds of ground warning a line spell gives before it lands; 0 = instant.")]
+        [Tooltip("Rift-only: width of the broken ground band at the ring's rim.")]
+        public float RiftBand;
+        [Tooltip("Seconds of ground warning an area spell gives before it lands; 0 = instant.")]
         public float Telegraph;
         [Tooltip("Line-spell-only: how far the strike travels; 0 falls back to Range.")]
         public float LineLength;
@@ -249,6 +249,14 @@ namespace Arena.Core
         public const float HasteTopSpeed = 18f;        public const float HasteGrip = 12f;
         /// <summary>Longest grip buff any ability hands out: the ceiling a guest accepts off the wire.</summary>
         public const float HasteMaxSeconds = 10f;
+        /// <summary>
+        /// Fastest top speed and hardest pull a grip buff may carry on the wire.
+        /// Ceilings a guest accepts, not balance: they have to stay clear of every
+        /// ability's BuffSpeed/BuffGrip, because a host hasted past them would look
+        /// like a corrupt snapshot and be rejected.
+        /// </summary>
+        public const float HasteMaxSpeed = 40f;
+        public const float HasteMaxGrip = 40f;
 
         // ---- bot brain ----
         public const float BotDecisionMin = 0.35f;
@@ -272,12 +280,26 @@ namespace Arena.Core
         public const float CameraDistance = 26f;
         public const bool CameraOrthographic = true;
         /// <summary>
-        /// Vertical half-extent of the orthographic view. Deliberately does NOT
-        /// frame the whole field any more: the rig follows the fighter, so the
-        /// camera stays close enough that a fighter reads clearly on a phone —
-        /// 11 shows about 22u of the 64u field.
+        /// Vertical half-extent of the orthographic view, i.e. the zoom. It was 11
+        /// while the fighters were capsules; the rigs and the aegis are worth looking
+        /// at, so it is 9.5 - the same fighter is 1.16x bigger and a 16:9 window spans
+        /// 34u instead of 39u. That is not taste alone, it is the tightest the camera
+        /// can come without costing something a player needs, and both bounds come out
+        /// of the game's own numbers:
+        /// - Look-ahead: the camera is pitched <see cref="CameraPitch"/> down, so a
+        ///   metre forward is only 0.85 m up the screen and the top edge of the window
+        ///   is <c>size / 0.85</c> metres ahead - 11.2u at 9.5, which is the longest
+        ///   line in the roster (the Mage's Vortex, thrown 12u down a lane from the
+        ///   caster's feet). At 8.5 the top edge is 10u and the funnel would spend its
+        ///   last stretch off screen, where its own warning could not be read.
+        /// - Spawn standoff: the spawns are 20u apart along X, which is the wide axis
+        ///   of the screen. At 20:9 (2.22) the foe starts at 0.97 of the viewport width
+        ///   and stays in frame; at 16:9 it is 1.01 and was already off the right edge
+        ///   at the old 11, so the spawn pair was never what this framed.
+        /// The rig's *distance* is not the zoom: an orthographic camera has no
+        /// perspective, so pulling it back changes nothing on screen.
         /// </summary>
-        public const float CameraOrthoSize = 11f;
+        public const float CameraOrthoSize = 9.5f;
 
         // Derivatives need Mathf.Sin/Cos, which are not compile-time constants.
         public static readonly float CameraHeight =
@@ -287,7 +309,7 @@ namespace Arena.Core
 
         // ---- characters ----
         private static CharacterDef _vanguard;
-        private static CharacterDef _storm;
+        private static CharacterDef _mage;
         private static CharacterDef _assassin;
 
         public static CharacterDef Vanguard
@@ -299,7 +321,7 @@ namespace Arena.Core
                     _vanguard = new CharacterDef
                     {
                         Id = CharacterId.Vanguard,
-                        DisplayName = "Ice Vanguard",
+                        DisplayName = "Vanguard",
                         Role = "Tank · Controller",
                         IconEmoji = "V",
                         Color = new Color(0.247f, 0.592f, 1f),
@@ -326,8 +348,11 @@ namespace Arena.Core
                             },
                             new AbilityDef
                             {
+                                // The id stays: the display name is what the HUD shows and what
+                                // the player reads, the id is what any saved or wire data would
+                                // refer to, so only the name moved.
                                 Id = "frost_aegis",
-                                DisplayName = "Frost Aegis",
+                                DisplayName = "Shield",
                                 Description = "Shield that soaks damage",
                                 Cooldown = 9f,
                                 Damage = 0f,
@@ -341,15 +366,18 @@ namespace Arena.Core
                             {
                                 Id = "earthrift",
                                 DisplayName = "Earthrift",
-                                Description = "Telegraph a line, then split it open",
+                                Description = "Telegraph a ring, then split it open",
                                 Cooldown = 13f,
                                 Damage = 18f,
                                 KnockImpulse = 13f,
                                 Stun = 0.5f,
-                                Range = 11f,           // rift length
-                                RiftWidth = 2.6f,
-                                // The ground cracks late enough that a fighter in the
-                                // corridor can step out of it.
+                                // The rift is a circle drawn around the caster, so the
+                                // Vanguard stands in its middle: Range is the radius,
+                                // and everyone caught inside is thrown outward from him.
+                                Range = 4.5f,
+                                RiftBand = 1.5f,
+                                // The ground cracks late enough that a fighter standing
+                                // in the ring can walk out of it.
                                 Telegraph = 0.7f
                             }
                         }
@@ -359,17 +387,17 @@ namespace Arena.Core
             }
         }
 
-        public static CharacterDef Storm
+        public static CharacterDef Mage
         {            get
             {
-                if (_storm == null)
+                if (_mage == null)
                 {
-                    _storm = new CharacterDef
+                    _mage = new CharacterDef
                     {
-                        Id = CharacterId.Storm,
-                        DisplayName = "Storm Mage",
+                        Id = CharacterId.Mage,
+                        DisplayName = "Mage",
                         Role = "Ranged Control Mage",
-                        IconEmoji = "S",
+                        IconEmoji = "M",
                         Color = new Color(0.647f, 0.361f, 1f),
                         ColorLight = new Color(0.890f, 0.784f, 1f),
                         Abilities = new[]
@@ -408,16 +436,16 @@ namespace Arena.Core
                                 Damage = 10f,
                                 KnockImpulse = 24.5f,    // 980px/s
                                 Stun = 0.3f,
-                                Range = 6.5f,            // 260px burst radius
+                                Range = 6.5f,            // 260px burst radius, untouched: only the funnel shrank
                                 HazardLifetime = 1.7f,   // also the travel time down the line
-                                HazardRadius = 6f,       // 240px pull radius
+                                HazardRadius = 4.5f,     // 180px pull radius: a 9u funnel, not 12u
                                 LineLength = 12f,        // thrown, not dropped at the caster
                                 Telegraph = 0.55f
                             }
                         }
                     };
                 }
-                return _storm;
+                return _mage;
             }
         }
 
@@ -430,7 +458,7 @@ namespace Arena.Core
                     _assassin = new CharacterDef
                     {
                         Id = CharacterId.Assassin,
-                        DisplayName = "Night Assassin",
+                        DisplayName = "Assassin",
                         Role = "Skirmisher · Burst",
                         IconEmoji = "A",
                         // Crimson, deliberately deeper than the HUD's own alert red
@@ -496,7 +524,7 @@ namespace Arena.Core
         public static CharacterDef Get(CharacterId id) => id switch
         {
             CharacterId.Assassin => Assassin,
-            CharacterId.Storm => Storm,
+            CharacterId.Mage => Mage,
             _ => Vanguard
         };
     }

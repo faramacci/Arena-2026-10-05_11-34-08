@@ -4,11 +4,36 @@ Three game characters are built procedurally from their reference sheets, so
 proportions, plate layers and the palette can be re-tuned without modelling by
 hand:
 
-| Character | Script | FBX |
-| --- | --- | --- |
-| Paladin — blue-and-gold plate knight, lion pauldrons, sword and lion shield | `build_paladin.py` | `paladin.fbx` (51k tris, 13 slots, 1.92 m) |
-| Mage — indigo robed staff mage with a glowing crystal | `build_mage.py` | `mage.fbx` (34k tris, 17 slots, 1.90 m + 0.19 m staff) |
-| Assassin — hooded knife fighter, brown-black leather, torn crimson skirt | `build_assassin.py` | `assassin.fbx` (56k tris, 9 slots, 21 bones, 1.92 m) |
+All three carry the same 21-bone `rig_kit.py` skeleton and ship as skinned meshes,
+so they can be animated rather than imported as props.
+
+| Character | Script | FBX | Triangles | Slots | Bones | Height |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vanguard — blue-and-gold plate knight, lion pauldrons, sword and lion shield | `build_paladin.py` | `vanguard.fbx` | 51,260 | 13 | 21 | 1.92 m |
+| Mage — indigo robed staff mage with a glowing crystal | `build_mage.py` | `mage.fbx` | 38,308 | 17 | 21 | 2.09 m (staff) |
+| Assassin — hooded knife fighter, brown-black leather, torn crimson skirt | `build_assassin.py` | `assassin.fbx` | 56,200 | 9 | 21 | 1.92 m |
+
+The knight is the game's Vanguard, so its FBX ships under that name while the
+script, the renders and the review scene still call it the paladin.
+
+Two of the hand props ship as their own FBXs, cut out of the body by `prop_kit.py`:
+
+| Prop | Script that cuts it | FBX | Worn by |
+| --- | --- | --- | --- |
+| Vanguard's lion shield | `build_paladin.py` | `vanguard_shield.fbx` | `PropLibrary` on the left forearm, in the air on Shield Throw |
+| Assassin's knife | `build_assassin.py` | `assassin_dagger.fbx` | `PropLibrary` in the right fist, in the air on Dagger Throw and Blade Wave |
+
+Each prop file carries the piece **twice**: once in the forearm's (or the fist's)
+frame, which is what the arm wears, and once in a flight frame with its origin at
+the balance point, which is what a throw spawns. `extract()` runs before anything is
+weighted or joined, so the prop never touches the body's skinning, and the object
+left in the body mesh is the empty space where it used to be - which is why the hand
+reads as empty for the beat the prop is away.
+
+The flight frame's forward is Blender **-Y**, not `+Y`: the FBX conversion maps
+Blender `+Y` to Unity `-Z`, and the game throws the prop along its own `+Z`.
+`orient_for_flight()` builds the frame that way, so a shield that left the arm
+edge-on arrives face-first.
 
 ## Build
 
@@ -71,9 +96,11 @@ a GUI Blender and still work; `mcp_send.py` is a one-shot sender for port 9876.
 ## Verify
 
 ```bash
-"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_fbx.py -- paladin
+"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_fbx.py -- vanguard
 "/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_fbx.py -- mage
 "/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_fbx.py -- assassin
+"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_rig.py -- vanguard
+"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_rig.py -- mage
 "/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/check_rig.py -- assassin
 ```
 
@@ -93,6 +120,7 @@ missing, has degenerate faces, floats off the floor or lost its scale.
 | Path | What it is |
 | --- | --- |
 | `Assets/Resources/Arena/Fighters/*.fbx` | The game assets: one mesh each, UV-mapped, triangulated, feet at the origin |
+| `Assets/Resources/Arena/Fighters/vanguard_shield.fbx`, `assassin_dagger.fbx` | The hand props, worn copy plus throwable copy (see above) |
 | `Tools/Blender/renders/<name>_*.png` | Lit views, 700×980, EEVEE |
 | `Tools/Blender/renders/review*.html` | Self-contained contact sheets for review |
 | `Tools/Blender/{paladin,mage,assassin}_review.blend` | The lit review scenes (opening an FBX alone gives a dark viewport, which reads as "the model looks bad") |
@@ -117,10 +145,13 @@ it can be loaded with `Resources.Load<GameObject>("Arena/Fighters/<name>")`.
 - **`LEG_X`, `ARM_X`, `stage_cloth`'s panel table** in `build_assassin.py` — the
   skirt is placed around the hips in polar coordinates (theta 0 = front), so a new
   torn panel is one row in the table rather than a hand-placed shell.
-- **`RIG_LANDMARKS` and `PART_BONES`** in `build_assassin.py` — where this
-  character's joints sit and which of its parts are pinned to a bone instead of
-  placed by proximity. A new character passes its own numbers to
-  `rig_kit.landmarks()` and lists its own gear.
+- **`RIG_LANDMARKS` and `PART_BONES`** in `build_paladin.py`, `build_mage.py` and
+  `build_assassin.py` — where each character's joints sit and which of its parts
+  are pinned to a bone or blended across a set instead of placed by proximity. The
+  landmarks are the build's own numbers (belt height for the pelvis, the gauntlet
+  for the wrist, the poleyn for the knee); a new character passes its own set to
+  `rig_kit.landmarks()` and lists its own gear. A landmark the character does not
+  override keeps the 1.9 m default.
 - **`HEIGHT`, `LEG_X`, `ARM_X`, `PLATE`, `STAFF_X`** — overall scale and where the
   limbs and the staff sit.
 - **`build()` / `STAGES`** — the characters themselves.
@@ -162,10 +193,13 @@ from the body) and `dagger()` / `hip_knife()`, which bend their blades with
 
 `rig_kit.py` hangs a 21-bone humanoid armature on a built mesh — `hips, spine,
 chest, neck, head`, then `shoulder / upper_arm / forearm / hand` and `thigh / shin /
-foot / toe` on each side — and writes a skinned FBX:
+foot / toe` on each side — and writes a skinned FBX. All three characters are rigged,
+by the same code, with one copy of the landmarks per character:
 
 ```bash
-"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/build_assassin.py
+"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/build_paladin.py   # vanguard.fbx
+"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/build_mage.py      # mage.fbx
+"/o/Blender/blender.exe" --background --factory-startup --python Tools/Blender/build_assassin.py  # assassin.fbx
 ```
 
 Weights are computed in Python rather than with `ARMATURE_AUTO`: bone heat needs a
@@ -178,11 +212,35 @@ both unanswerable questions for a proximity search on the joined mesh. Blending
 happens only across the skeleton (the nearest bone plus its parent and children), so
 a thigh cannot pick up the hand that hangs beside it.
 
-`PART_BONES` in `build_assassin.py` pins the parts geometry cannot place: the knives
-ride the hands, and the belt, pouches and torn cloth ride the pelvis. `pose_test()`
-is the check that matters — it rotates one bone and reports how far that bone's own
-skin moves, how far the head moves and how far the opposite foot moves; the last two
-must stay at 0.000, and they are what catch a weight painted on the wrong bone.
+`PART_BONES` in each build names the parts geometry cannot place. An entry is either
+a single bone, which pins the part rigidly, or a *set* of bones, which the part is
+blended across:
+
+| Character | Pinned | Blended across |
+| --- | --- | --- |
+| Vanguard | sword to `hand.R`, shield to `forearm.L`, belt/skirt/straps to `hips`, chest filigree to `chest` | cape and tabard across `chest, spine, hips` |
+| Mage | staff, claws, crystals and sparks to `hand.L`, belt/pouches/tomes to `hips` | the ankle-length skirt across `spine, hips, thigh.L/R, shin.L/R`; the knee-length panels, apron and sigil across `spine, hips, thigh.L/R` |
+| Assassin | knives to the hands, belt, pouches, hip knives, skirt, sash to `hips` | — |
+
+A single bone has to be pinned because proximity gets it wrong: the sword in the
+fist hangs to the knee and the shield's centre sits nearer the *shoulder* than the
+forearm it is strapped to. A robe needs the set because it hangs around the pelvis,
+both thighs and both shins at once — the skirt's own centre is nearest a *shin*, so
+left to proximity the whole robe would ride one leg. Blended parts are weighted with
+a softer falloff and with the ratio cutoff and the weight floor switched off: both
+of those are step functions in space, and a step in the weights is a step in the
+skin: with them on, the mage's robe tore along the line where one leg's shin
+stopped being the nearer bone (an x11 edge stretch on a 45° thigh rotation).
+
+`pose_test()` is the check that matters — it rotates one bone and reports how far
+that bone's own skin moves, how far the head moves and how far the opposite foot
+moves; the last two must stay at 0.000, and they are what catch a weight painted on
+the wrong bone. Stretch is the other half: opening a review `.blend` and measuring
+every edge under a 45° pose shows how much the skin is torn rather than moved. What
+is left sits in shells that straddle a joint — hair and beard on the neck/head
+boundary (x2.2 mage, x2.6 vanguard, x4.6 assassin), the pauldron wing across the
+arm/shoulder boundary (x2 vanguard, x15 assassin) and the robe hem where the two
+legs diverge (x1.7 mage, on 147 of the robe's edges).
 
 ### Cleanup pass
 
@@ -193,10 +251,18 @@ and has been discarded", which looks like a broken import in the console.
 
 ## Notes for the next pass
 
-The paladin and the mage are still static meshes — only the assassin carries the
-`rig_kit.py` skeleton so far, and none of the three has animation clips, so the rig
-is a skeleton to animate rather than a walk cycle. All of them use flat materials
-only, with no texture atlas. The current gameplay animates primitives in code, so
-the FBX files still work as static meshes. Three scripts now each carry their own
-copy of the render/export wrapper; extracting one shared `kit.py` would be the next
-cleanup.
+All three fighters now carry the same 21-bone skeleton, but none of them has an
+animation clip yet, so the rig is a skeleton to animate rather than a walk cycle. The
+game drives those bones itself: `Assets/Scripts/Presentation/FighterModel.cs` loads the
+FBX from Resources, yaws it onto the game's forward axis (the skinned export's axis
+conversion leaves it facing -Z), and rebuilds the stride, cast and recoil poses as bone
+rotations about the character's own axes. A model that is missing leaves the fighter on
+the primitive body it used to be, which is what `CharacterView` falls back to.
+
+In Unity each FBX imports as a *generic* rig: to retarget Mecanim clips instead of
+posing the bones in code, set Rig → Animation Type to **Humanoid** (or map the bones by
+hand) in the model importer, which is an editor-side step no script here can do. The rig
+has no IK, no twist bones and no finger bones, and the cloth is linear-blend skinned
+rather than simulated. All of them use flat materials only, with no texture atlas. Three
+scripts each carry their own copy of the render/export wrapper; batching the three
+characters into one build script (and one shared `kit.py`) would be the next cleanup.

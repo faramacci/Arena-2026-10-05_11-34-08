@@ -59,33 +59,25 @@ namespace Arena.Gameplay
         }
 
         /// <summary>
-        /// Corridor hit for the Earthrift: the target has to sit inside the band
-        /// that starts at <paramref name="origin"/> and runs <paramref name="length"/>
-        /// along <paramref name="dir"/>, within <paramref name="halfWidth"/> of its
-        /// centre line. The launch follows the rift, so the victim is thrown down
-        /// the crack instead of radially away from the caster. The origin is passed
-        /// in rather than read from the caster because the corridor lands after its
-        /// warning, by which time the caster may have moved.
+        /// Disc hit for the Earthrift: the target has to stand inside the circle of
+        /// <paramref name="radius"/> drawn around <paramref name="centre"/>, which is
+        /// the caster the ring is centred on. The launch is radial - the ground opens
+        /// under the victim and throws them away from the fighter standing in the
+        /// middle of it. The centre is passed in rather than read from the caster
+        /// because the ring lands after its warning, by which time the caster may
+        /// have walked.
         /// </summary>
-        public static bool TryLineHit(Vector3 origin, FighterSim target, AbilityDef ab,
-            Vector3 dir, float length, float halfWidth)
+        public static bool TryCircleHit(Vector3 centre, FighterSim target, AbilityDef ab,
+            float radius)
         {
             if (target.Dead || target.Invulnerable > 0f) return false;
-            Vector3 flat = new Vector3(dir.x, 0f, dir.z);
-            if (flat.sqrMagnitude < 0.0001f) return false;
-            flat.Normalize();
 
-            Vector3 offset = target.Position - origin;
-            offset.y = 0f;
-            float along = Vector3.Dot(offset, flat);
-            if (along < -GameConfig.PlayerRadius ||
-                along > length + GameConfig.PlayerRadius) return false;
+            Vector3 away = target.Position - centre;
+            away.y = 0f;
+            if (away.magnitude > radius + GameConfig.PlayerRadius) return false;
 
-            // Cross product with the centre line gives the perpendicular offset.
-            float across = Mathf.Abs(offset.x * flat.z - offset.z * flat.x);
-            if (across > halfWidth + GameConfig.PlayerRadius) return false;
-
-            ApplyHit(target, ab, flat);
+            // Dead centre has no direction of its own; the rift still has to throw.
+            ApplyHit(target, ab, away.sqrMagnitude > 0.0001f ? away : Vector3.forward);
             return true;
         }
 

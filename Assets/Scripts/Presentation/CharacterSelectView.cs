@@ -51,6 +51,8 @@ namespace Arena.Presentation
 
         /// <summary>Which mode this picker is currently set up for.</summary>
         public GameMode Mode => mode;
+        /// <summary>The last address discovery offered, so a newer one may replace it.</summary>
+        private string offeredAddress;
         /// <summary>Live zone pick: a host may still change it while waiting.</summary>
         public ZoneShape Zone => zone;
         /// <summary>The address typed for a join.</summary>
@@ -413,6 +415,7 @@ namespace Arena.Presentation
             Repaint((RectTransform)zoneGroup.Find("Seg"), (int)zone);
 
             if (hostAddress != null) hostAddress.text = string.Empty;
+            offeredAddress = null;
             ApplyMode();
             ChooseCharacter(current);
             SetStatus(string.Empty, false);
@@ -447,12 +450,34 @@ namespace Arena.Presentation
                         ? "Type the host's address, then join — the host decides the arena."
                         : "Your phone owns the arena. The guest picks their fighter on their own screen.";
 
-            startLabel.text = mode == GameMode.Bot ? "START MATCH"
-                : mode == GameMode.Campaign ? $"START STAGE {stage}"
-                : join ? "JOIN BATTLE"
-                : "HOST BATTLE";
+            RefreshActionLabel();
+        }
 
-            if (!busy) status.text = string.Empty;
+        /// <summary>
+        /// The one big button: the mode's own verb, or CANCEL while a network
+        /// wait is up - a host waiting for a guest, or a guest waiting on a
+        /// connect, must always have a way out that does not depend on finding
+        /// the BACK button.
+        /// </summary>
+        private void RefreshActionLabel()
+        {
+            startLabel.text = busy ? "CANCEL"
+                : mode == GameMode.Bot ? "START MATCH"
+                : mode == GameMode.Campaign ? $"START STAGE {stage}"
+                : mode == GameMode.LanJoin ? "JOIN BATTLE"
+                : "HOST BATTLE";
+        }
+
+        /// <summary>
+        /// Offers an address discovery heard, without overwriting one the player
+        /// typed themselves - only an earlier offer is replaced.
+        /// </summary>
+        public void SetHostAddress(string address)
+        {
+            if (hostAddress == null || string.IsNullOrEmpty(address)) return;
+            if (!string.IsNullOrEmpty(hostAddress.text) && hostAddress.text != offeredAddress) return;
+            offeredAddress = address;
+            if (hostAddress.text != address) hostAddress.text = address;
         }
 
         /// <summary>Moves the selection ring and tells the game which fighter was taken.</summary>
@@ -472,20 +497,32 @@ namespace Arena.Presentation
             CharacterChosen?.Invoke(id);
         }
 
-        /// <summary>The single big action. Ignored while a network wait is up.</summary>
+        /// <summary>The single big action: start the match, or leave a network wait.</summary>
         public void PressStart()
         {
-            if (busy || !startButton.interactable) return;
+            if (!startButton.interactable) return;
+            if (busy) { CancelRequested?.Invoke(); return; }
             startPulse?.PlayPop(0.22f);
             StartRequested?.Invoke();
         }
 
-        /// <summary>Network waits lock the action button and explain themselves.</summary>
-        public void SetStatus(string text, bool waiting)
+        /// <summary>
+        /// The line under the options: what a network wait is doing, or why the
+        /// last attempt failed. The button never goes dead - a wait shows
+        /// CANCEL and a failure leaves the mode's own verb up for a retry.
+        /// </summary>
+        public void SetStatus(string text, bool waiting, bool failed = false)
         {
+            string line = text ?? string.Empty;
+            Color wanted = failed ? UiFactory.Bad : waiting ? UiFactory.Good : UiFactory.Muted;
+            // Discovery re-offers its line every frame; only a real change is worth
+            // touching the label and the button.
+            if (busy == waiting && status.text == line && status.color == wanted) return;
             busy = waiting;
-            status.text = text;
-            startButton.interactable = !waiting;
+            status.text = line;
+            status.color = wanted;
+            startButton.interactable = true;
+            RefreshActionLabel();
         }
     }
 }

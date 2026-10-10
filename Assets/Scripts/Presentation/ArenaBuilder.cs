@@ -6,9 +6,19 @@ namespace Arena.Presentation
 {
     /// <summary>
     /// Builds the battleground out of primitives at runtime, themed as an
-    /// arcane gladiator colosseum: Roman sand and travertine masonry, a glowing
-    /// runic light-band and hanging candles (wizarding), and a rune circle,
-    /// obelisks and a warded barrier ring on a tiered amphitheatre (Middle-earth).
+    /// arcane gladiator colosseum: a frozen arena field ringed by molten rock,
+    /// travertine masonry, a glowing runic light-band and hanging candles
+    /// (wizarding), and a rune circle, obelisks and a warded barrier ring on a
+    /// tiered amphitheatre (Middle-earth).
+    ///
+    /// The field itself is one painted sheet, `Resources/Arena/ArenaField`, made by
+    /// `Tools/Blender/arena_field.py`: a top-down map of the outer plinth's 124 m
+    /// footprint with the ice of the arena in the middle and the molten rock of the
+    /// plinth around it. Every surface that is ground reads its own window out of
+    /// that one image, so the ice meets the rock at the arena's own edge, under the
+    /// wall runs, and the plinth rings line up with each other. The sheet is painted
+    /// against <see cref="GameConfig.ArenaWidth"/> = 64; change the width and it has
+    /// to be painted again.
     ///
     /// Everything is generated from <see cref="GameConfig"/>, so the sand floor,
     /// the perimeter wall and both zone shapes stay in lock-step with the
@@ -25,8 +35,10 @@ namespace Arena.Presentation
     {
         [Header("Arena palette")]
         [SerializeField] private Color zoneColor = new Color(0.50f, 0.86f, 1f);
+        /// <summary>Fallback for the floor when the painted field sheet is missing.</summary>
         [SerializeField] private Color sandColor = new Color(0.78f, 0.69f, 0.49f);
-        [SerializeField] private Color safeSandColor = new Color(0.90f, 0.83f, 0.63f);
+        /// <summary>The sheen that marks the safe ground over that sheet.</summary>
+        [SerializeField] private Color safeSandColor = new Color(0.62f, 0.88f, 1f, 0.20f);
         [SerializeField] private Color stoneColor = new Color(0.56f, 0.54f, 0.50f);
         [SerializeField] private Color darkStoneColor = new Color(0.21f, 0.20f, 0.23f);
         [SerializeField] private Color marbleColor = new Color(0.88f, 0.86f, 0.82f);
@@ -50,6 +62,22 @@ namespace Arena.Presentation
         // batches instead of one draw call per object.
         private Material mSand, mSafe, mStone, mDark, mMarble, mBronze;
         private Material mRune, mArcane, mFire, mCandle, mZone, mWard;
+        private Material mIce, mLavaInner, mLavaOuter;
+
+        /// <summary>
+        /// The painted field sheet, cached for the session: a rebuild hands out fresh
+        /// material instances but the image itself never changes.
+        /// </summary>
+        private static Texture2D fieldSheet;
+
+        private static Texture2D FieldSheet
+        {
+            get
+            {
+                if (fieldSheet == null) fieldSheet = Resources.Load<Texture2D>("Arena/ArenaField");
+                return fieldSheet;
+            }
+        }
 
         private float HalfWall => GameConfig.ArenaWidth * 0.5f; // 16
 
@@ -111,8 +139,19 @@ namespace Arena.Presentation
 
         private void MakePalette()
         {
+            // The world units the sheet spans, and the footprint each surface covers
+            // in the same units: the sheet's own quarter is what lines them up.
+            float sheetSpan = S(62f);
+            float arenaSpan = GameConfig.ArenaWidth + 0.4f;
             mSand = MakeLit(sandColor);
-            mSafe = MakeLit(safeSandColor);
+            mIce = MakeField(true, "Arena_Ice", arenaSpan / sheetSpan, 0.5f - arenaSpan / sheetSpan * 0.5f);
+            mLavaInner = MakeField(false, "Arena_Lava_Inner", S(54f) / sheetSpan,
+                0.5f - S(54f) / sheetSpan * 0.5f);
+            mLavaOuter = MakeField(false, "Arena_Lava_Outer", 1f, 0f);
+            // The safe ground is a sheen over the ice rather than a slab of its own
+            // colour: the field has to stay visible inside the zone, or the whole
+            // arena would be one flat plate.
+            mSafe = MakeTransparentUnlit(safeSandColor);
             mStone = MakeLit(stoneColor);
             mDark = MakeLit(darkStoneColor);
             mMarble = MakeLit(marbleColor);
@@ -127,22 +166,32 @@ namespace Arena.Presentation
 
         // ================================================================ layers
 
-        /// <summary>Stepped stone plinth the whole colosseum sits on.</summary>
+        /// <summary>
+        /// Stepped plinth the whole colosseum sits on. Both of its caps are windows on
+        /// the same sheet the floor uses - a cylinder's cap is unwrapped across its own
+        /// diameter - so the molten rock runs unbroken from the arena wall to the rim.
+        /// </summary>
         private void BuildBase()
         {
             Prim(PrimitiveType.Cylinder, "Plinth_Outer", geometry,
-                new Vector3(0f, -1.15f, 0f), new Vector3(S(62f), 0.25f, S(62f)), mDark);
+                new Vector3(0f, -1.15f, 0f), new Vector3(S(62f), 0.25f, S(62f)),
+                mLavaOuter != null ? mLavaOuter : mDark);
             Prim(PrimitiveType.Cylinder, "Plinth_Inner", geometry,
-                new Vector3(0f, -0.53f, 0f), new Vector3(S(54f), 0.45f, S(54f)), mStone);
+                new Vector3(0f, -0.53f, 0f), new Vector3(S(54f), 0.45f, S(54f)),
+                mLavaInner != null ? mLavaInner : mStone);
         }
 
-        /// <summary>Square sand arena, top face flush with the sim plane (y = 0).</summary>
+        /// <summary>
+        /// Square arena floor, top face flush with the sim plane (y = 0). Its top face
+        /// maps the sheet's windows across its own footprint, which is what puts the
+        /// ice exactly on the arena and nothing but ice.
+        /// </summary>
         private void BuildSandFloor()
         {
             Prim(PrimitiveType.Cube, "Sand", geometry,
                 new Vector3(0f, -0.06f, 0f),
                 new Vector3(GameConfig.ArenaWidth + 0.4f, 0.12f, GameConfig.ArenaHeight + 0.4f),
-                mSand);
+                mIce != null ? mIce : mSand);
         }
 
         /// <summary>
@@ -469,6 +518,29 @@ namespace Arena.Presentation
             m.DisableKeyword("_ALPHATEST_ON");
             m.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
             m.name = "Arena_Ward";
+            return m;
+        }
+
+        /// <summary>
+        /// One window of the painted field sheet: the same image on every ground
+        /// surface, each with its own tiling and offset, so a mark in the paint lands
+        /// on the world position the paint was made for. Without the sheet - a fresh
+        /// checkout - this returns null and the caller keeps its flat colour.
+        /// </summary>
+        private static Material MakeField(bool lit, string name, float scale, float offset)
+        {
+            Texture2D sheet = FieldSheet;
+            if (sheet == null) return null;
+            Material m = lit ? MakeLit(Color.white) : MakeUnlit(Color.white);
+            if (m == null) return null;
+            m.name = name;
+            ApplyColor(m, Color.white);
+            if (m.HasProperty("_BaseMap"))
+            {
+                m.SetTexture("_BaseMap", sheet);
+                m.SetTextureScale("_BaseMap", new Vector2(scale, scale));
+                m.SetTextureOffset("_BaseMap", new Vector2(offset, offset));
+            }
             return m;
         }
 

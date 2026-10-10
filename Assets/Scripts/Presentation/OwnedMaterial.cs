@@ -7,6 +7,7 @@ namespace Arena.Presentation
     public sealed class OwnedMaterial : MonoBehaviour
     {
         private Material owned;
+        private Material[] ownedSet;
         public Material Material => owned;
 
         public static void Assign(GameObject target, Material material)
@@ -16,6 +17,18 @@ namespace Arena.Presentation
             owner.Release();
             owner.owned = material;
             target.GetComponent<Renderer>().sharedMaterial = material;
+        }
+
+        /// <summary>
+        /// Owns a set of generated materials for one renderer with many slots - the
+        /// fighter models carry 9 to 17 of them - so they die with the fighter.
+        /// </summary>
+        public static void AssignAll(GameObject target, Material[] materials)
+        {
+            var owner = target.GetComponent<OwnedMaterial>();
+            if (owner == null) owner = target.AddComponent<OwnedMaterial>();
+            owner.Release();
+            owner.ownedSet = materials;
         }
 
         /// <summary>
@@ -60,10 +73,23 @@ namespace Arena.Presentation
 
         private void Release()
         {
-            if (owned == null) return;
-            if (Application.isPlaying) Destroy(owned);
-            else DestroyImmediate(owned);
-            owned = null;
+            if (owned != null)
+            {
+                Let(owned);
+                owned = null;
+            }
+            if (ownedSet != null)
+            {
+                foreach (var material in ownedSet)
+                    if (material != null) Let(material);
+                ownedSet = null;
+            }
+        }
+
+        private static void Let(Material material)
+        {
+            if (Application.isPlaying) Destroy(material);
+            else DestroyImmediate(material);
         }
     }
 }

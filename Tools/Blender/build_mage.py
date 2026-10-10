@@ -1,4 +1,4 @@
-"""Build the Storm Mage (the indigo robed staff mage) from the reference sheet.
+"""Build the Mage (the indigo robed staff mage) from the reference sheet.
 
 Same shape language as the Paladin - lofts, shells, domes - and it borrows that
 script's geometry helpers instead of copying them, so the two characters stay
@@ -9,15 +9,15 @@ Drive it in stages so a running Blender shows the build happening:
     import build_mage
     build_mage.prepare()            # clear the scene, set up materials
     for stage in build_mage.STAGES: print(stage, build_mage.build(stage))
-    build_mage.finish()             # join, clean, unwrap, export FBX, render
+    build_mage.finish()             # join, clean, unwrap, rig, export FBX, render
 
 Headless:
 
     "O:/Blender/blender.exe" --background --factory-startup --python Tools/Blender/build_mage.py
 
 Outputs:
-    Assets/Resources/Arena/Fighters/mage.fbx
-    Tools/Blender/renders/mage_*.png
+    Assets/Resources/Arena/Fighters/mage.fbx    skinned, feet at z=0, facing +Y in Blender
+    Tools/Blender/renders/mage_*.png            review views incl. a posed one
     Tools/Blender/mage_review.blend
 
 Landmarks read off the reference against a 1.90 m figure: hem 0.16, belt 1.20,
@@ -41,6 +41,28 @@ RES = (700, 980)
 
 STAFF_X = -0.40          # the staff is held on the model's -X side, as in the sheet
 STAFF_Y = 0.12
+
+
+def load_rig():
+    """Import rig_kit.py, the shared armature/skinning module."""
+    path = os.path.join(HERE, "rig_kit.py")
+    spec = importlib.util.spec_from_file_location("rig_kit", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+RIG = load_rig()
+
+# Where the mage's joints sit, read off the same numbers the stages are built
+# from: the belt at 1.12-1.28 for the pelvis, the mantle and shoulders at 1.44,
+# the sleeve's cuff at 1.04 for the wrist, the hand balls at 0.83, the boot tops
+# at 0.17 for the ankles and the shins' upper end at 0.52 for the (robed) knees.
+RIG_LANDMARKS = RIG.landmarks(
+    hip_z=1.020, spine_z=1.160, chest_z=1.350, neck_z=1.600, head_z=1.680,
+    head_top=1.900, shoulder_x=0.070, shoulder_out=0.230, shoulder_z=1.440,
+    arm_x=0.265, elbow_z=1.190, wrist_z=0.930, hand_end_z=0.800, leg_x=0.125,
+    knee_z=0.580, ankle_z=0.170, toe_y=0.150, toe_end_y=0.245, ground=0.040)
 
 
 def load_kit():
@@ -468,7 +490,20 @@ def prepare():
     return "cleared " + (", ".join(removed) if removed else "nothing")
 
 
-def render_views(obj):
+# Whole-figure views first, then the head and the staff, which carry the detail.
+VIEWS = (("front", 90.0, 6.0, None, None),
+         ("threequarter", 128.0, 12.0, None, None),
+         ("side", 0.0, 6.0, None, None),
+         ("back", 270.0, 6.0, None, None),
+         ("head", 100.0, 3.0, Vector((0.0, 0.0, 1.76)), 0.52),
+         ("staff", 78.0, 8.0, Vector((STAFF_X, 0.0, 1.85)), 0.85))
+
+# The same view twice, once at rest and once posed: the pair is the only proof
+# that the skin follows the bones rather than the rig being decoration.
+POSE_VIEW = (("posed", 128.0, 12.0, None, None),)
+
+
+def render_views(obj, views=None, suffix="%s"):
     os.makedirs(RENDER_DIR, exist_ok=True)
     scene = bpy.context.scene
     scene.render.resolution_x, scene.render.resolution_y = RES
@@ -490,12 +525,7 @@ def render_views(obj):
     focus = Vector((0.0, 0.0, (low + high) * 0.5))
     log("frame: z %.3f..%.3f (span %.3f)" % (low, high, span))
 
-    views = (("front", 90.0, 6.0, None, None),
-             ("threequarter", 128.0, 12.0, None, None),
-             ("side", 0.0, 6.0, None, None),
-             ("back", 270.0, 6.0, None, None),
-             ("head", 100.0, 3.0, Vector((0.0, 0.0, 1.76)), 0.52),
-             ("staff", 78.0, 8.0, Vector((STAFF_X, 0.0, 1.85)), 0.85))
+    views = VIEWS if views is None else views
     shots = []
     for name, yaw, pitch, custom_focus, custom_scale in views:
         target = focus if custom_focus is None else custom_focus
@@ -507,7 +537,7 @@ def render_views(obj):
         cam.location = target + offset
         cam.rotation_euler = (target - cam.location).normalized() \
             .to_track_quat("-Z", "Y").to_euler()
-        path = os.path.join(RENDER_DIR, "mage_%s.png" % name)
+        path = os.path.join(RENDER_DIR, "mage_%s.png" % (suffix % name))
         scene.render.filepath = path
         bpy.ops.render.render(write_still=True)
         log("rendered " + path)
@@ -515,10 +545,55 @@ def render_views(obj):
     return shots
 
 
-def finish(export=True, render=True):
-    """Join, clean, unwrap, write the FBX and (optionally) render the views."""
+# ------------------------------------------------------------------------- rig
+
+# Bones the robe hangs from. The skirt reaches the ankles and the panels hang
+# around both legs, so no single bone's chain describes the cloth: without this
+# set the skirt's own centre is nearest the *shin*, and the whole robe would ride
+# one leg. Blended across the pelvis, both thighs and both shins instead, so a
+# raised knee takes the cloth in front of it with it.
+ROBE_BONES = ("spine", "hips", "thigh.L", "thigh.R", "shin.L", "shin.R")
+# The shorter layers - the panels that end at the knee and the front apron - stop
+# above the shins, so they are driven by the pelvis and the thighs alone.
+SKIRT_BONES = ("spine", "hips", "thigh.L", "thigh.R")
+
+# Parts the rig cannot place from their own position: the staff is gripped in the
+# left fist but stands 1.7 m tall beside the leg, and the belt gear rides the
+# pelvis rather than the thigh it hangs beside.
+PART_BONES = (
+    ("mage_staff_", "hand.L"), ("mage_claw_", "hand.L"),
+    ("mage_crystal", "hand.L"), ("mage_spark_", "hand.L"),
+    ("mage_skirt", ROBE_BONES), ("mage_panel_", SKIRT_BONES),
+    ("mage_apron", SKIRT_BONES), ("mage_sigil", SKIRT_BONES),
+    ("mage_belt", "hips"), ("mage_buckle_gem", "hips"),
+    ("mage_pouch_", "hips"), ("mage_tome_", "hips"))
+
+
+def part_bone(name):
+    """The bone a part must ride, or the set it must blend across, or None."""
+    for prefix, bone in PART_BONES:
+        if name.startswith(prefix):
+            return bone
+    return None
+
+
+def finish(export=True, render=True, rig=True):
+    """Join, clean, unwrap, rig, write the FBX and (optionally) render the views."""
     if not PARTS:
         raise RuntimeError("nothing built yet - call build(stage) first")
+    armature = None
+    if rig:
+        # Weight the parts before the join: each one is judged from its own centre,
+        # which is the difference between a belt pouch following the pelvis and it
+        # following the forearm.
+        armature = RIG.build_armature("Mage_Rig", RIG_LANDMARKS)
+        segments = RIG.deform_bones(armature)
+        placed = 0
+        for part in PARTS:
+            bone = part_bone(part.name)
+            placed += 1 if bone else 0
+            RIG.weight_part(part, armature, bone=bone, segments=segments)
+        log("rig: %d parts weighted (%d placed by name)" % (len(PARTS), placed))
     mage = KIT.join_parts(PARTS, name="Mage")
     clean_mesh(mage)
     unwrap(mage)
@@ -528,21 +603,43 @@ def finish(export=True, render=True):
         v.co.x for v in mage.data.vertices)
     log("mesh: %d triangles, %d faces, %d material slots, %.2f m tall, %.2f m wide"
         % (triangles, len(mage.data.polygons), len(mage.data.materials), height, width))
+    if armature is not None:
+        RIG.bind(mage, armature)
+        primary = RIG.primary_from_groups(mage)
+        test = RIG.pose_test(mage, armature, primary)
+        for bone, (own, head, far) in sorted(test.items()):
+            log("rig %-12s own skin %.3f m, head %.3f m, far foot %.3f m"
+                % (bone, own, head, far))
+        bleed = max(max(head, far) for _, head, far in test.values())
+        weak = min(own for own, _, _ in test.values())
+        log("rig check: weakest bone moves %.3f m, worst bleed %.3f m"
+            % (weak, bleed))
+        log("rig: %d bones, %d skinned vertices"
+            % (len(armature.data.bones), len(mage.data.vertices)))
     if export:
-        save_fbx = KIT.FBX_OUT
-        KIT.FBX_OUT = FBX_OUT
-        try:
-            KIT.export(mage)
-        finally:
-            KIT.FBX_OUT = save_fbx
+        if armature is not None:
+            RIG.export_skinned(mage, armature, FBX_OUT)
+            log("exported " + FBX_OUT + " (skinned)")
+        else:
+            save_fbx = KIT.FBX_OUT
+            KIT.FBX_OUT = FBX_OUT
+            try:
+                KIT.export(mage)
+            finally:
+                KIT.FBX_OUT = save_fbx
     shots = render_views(mage) if render else []
+    if armature is not None and render:
+        RIG.showcase_pose(armature)
+        shots += render_views(mage, POSE_VIEW)
+        RIG.clear_pose(armature)
     try:
         bpy.ops.wm.save_as_mainfile(filepath=BLEND_OUT, copy=True)
         log("saved " + BLEND_OUT)
     except Exception as exc:
         log("blend save skipped (%s)" % exc)
-    return "Mage: %d triangles, %.2f m tall, %d slots, %d views" % (
-        triangles, height, len(mage.data.materials), len(shots))
+    return "Mage: %d triangles, %.2f m tall, %d slots, %d bones, %d views" % (
+        triangles, height, len(mage.data.materials),
+        0 if armature is None else len(armature.data.bones), len(shots))
 
 
 def main():

@@ -3,6 +3,7 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.UI;
+using UnityEngine.SceneManagement;
 using TMPro;
 using Arena.Core;
 using Arena.Gameplay;
@@ -57,6 +58,16 @@ namespace Arena
         private float timer;
         private float goTimer = -1f;
         private LanSession network;
+        /// <summary>Shouts this phone's port while it hosts, so a guest can find it.</summary>
+        private LanBeacon beacon;
+        /// <summary>Listens for a host while the picker is set to join.</summary>
+        private LanFinder finder;
+        /// <summary>The address discovery last offered, used when the field is empty.</summary>
+        private string discoveredAddress;
+        /// <summary>The last network failure, kept on the picker until the next attempt.</summary>
+        private string pickerError;
+        /// <summary>The picker role the bootstrap last saw, so a switch retires an old failure.</summary>
+        private GameMode pickerModeSeen = GameMode.Bot;
         private bool handshake;
         private CharacterId networkCharacter;
         private ZoneShape networkZone;
@@ -91,12 +102,63 @@ namespace Arena
 
         // ------------------------------------------------------------------ boot
 
+        /// <summary>
+        /// The root objects this game builds at runtime. None of them is authored in a
+        /// scene, so one found at boot - or left after Play Mode stops - belongs to a
+        /// session that is already over.
+        /// </summary>
+        public static readonly string[] RuntimeRoots =
+            { "GameBootstrap", "Arena", "GameCanvas", "MatchFx", "EventSystem" };
+
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void Install()
         {
+            // This project enters Play Mode with both reloads disabled, so the world a
+            // previous session built is still in the scene when this one starts - and
+            // whatever it was doing when it stopped, spent knives and shields lying on
+            // the sand included, would be sitting under the new match. Sweep first.
+            int swept = ClearLeftoverSceneObjects();
+            if (swept > 0)
+                Debug.Log("[Bootstrap] cleared " + swept +
+                          " object(s) left in the scene by an earlier session.");
+
             if (FindFirstObjectByType<GameBootstrap>() != null) return;
             var go = new GameObject("GameBootstrap");
             go.AddComponent<GameBootstrap>();
+        }
+
+        /// <summary>
+        /// Destroys what a finished session left in the open scene and returns how many
+        /// roots went. A root counts when it carries a fighter view, or when its name is
+        /// one of <see cref="RuntimeRoots"/> - the scene's authored objects (the camera,
+        /// the light, the volume) are never in either list. Extra names are for the
+        /// editor's own scratch scenes; nothing in the game passes any.
+        /// </summary>
+        public static int ClearLeftoverSceneObjects(params string[] alsoNames)
+        {
+            var roots = new List<GameObject>();
+            SceneManager.GetActiveScene().GetRootGameObjects(roots);
+            int gone = 0;
+            foreach (var root in roots)
+            {
+                if (root == null || !IsRuntimeRoot(root, alsoNames)) continue;
+                Object.DestroyImmediate(root);
+                gone++;
+            }
+            return gone;
+        }
+
+        private static bool IsRuntimeRoot(GameObject root, string[] alsoNames)
+        {
+            // A fighter view is the surest sign: the props a throw is drawn with hang
+            // off the same root, so sweeping the view sweeps the knives with it.
+            if (root.GetComponentInChildren<CharacterView>(true) != null) return true;
+            for (int i = 0; i < RuntimeRoots.Length; i++)
+                if (root.name == RuntimeRoots[i]) return true;
+            if (alsoNames == null) return false;
+            for (int i = 0; i < alsoNames.Length; i++)
+                if (root.name == alsoNames[i]) return true;
+            return false;
         }
 
         private void Awake()
@@ -238,6 +300,10 @@ namespace Arena
         private void ShowModeSelect()
         {
             CancelInvoke(nameof(HideCountdown));
+            CloseBeacon();
+            CloseFinder();
+            discoveredAddress = null;
+            pickerError = null;
             goTimer = -1f;
             endTimer = -1f;
             phase = Phase.Modes;
@@ -279,6 +345,8 @@ namespace Arena
             modes.Hide();
 
             signup.Show(mode, chosenCharacter, zone, botCount, campaignStage);
+            pickerModeSeen = mode;
+            pickerError = null;
             phase = Phase.Select;
             Debug.Log($"[Bootstrap] picker: mode={mode}, fighter={chosenCharacter}, " +
                       $"zone={zone}, {roster.BotCount} opponent(s).");
@@ -327,6 +395,19 @@ namespace Arena
         /// <summary>Hosts or joins according to the address the player typed.</summary>
         private void StartNetwork()
         {
+            pickerError = null;
+            // A guest who never typed anything joins whoever discovery heard.
+            string address = signup.HostAddress;
+            if (mode == GameMode.LanJoin && string.IsNullOrEmpty(address)) address = discoveredAddress;
+            if (mode == GameMode.LanJoin && string.IsNullOrEmpty(address))
+            {
+                // Nothing typed and nothing heard: say so, instead of handing an
+                // empty address to the socket layer. This is the one press that
+                // can never work, so it gets its own plain sentence.
+                FailOnPicker("Please enter the Host IP address — the host's screen shows it under the " +
+                    "HOST BATTLE button — or wait for the host to be found on this hotspot.");
+                return;
+            }
             try
             {
                 networkCharacter = chosenCharacter;
@@ -337,10 +418,10 @@ namespace Arena
                 sendTimer = 0f;
                 network = mode == GameMode.LanHost
                     ? LanSession.Host()
-                    : LanSession.Join(signup.HostAddress);
+                    : LanSession.Join(address);
                 Debug.Log(mode == GameMode.LanHost
                     ? $"[Network] hosting on TCP {LanSession.Port}."
-                    : $"[Network] joining {signup.HostAddress}:{LanSession.Port}.");
+                    : $"[Network] joining {address}:{LanSession.Port}.");
                 network.Received += OnNetworkMessage;
                 network.ConnectedToPeer += () =>
                 {
@@ -348,15 +429,39 @@ namespace Arena
                         network.Send(new LanMessage { kind = "hello", character = networkCharacter });
                 };
                 signup.SetStatus(mode == GameMode.LanHost
-                    ? "Host IP: " + LanSession.LocalAddresses() + " — waiting for player (TCP " + LanSession.Port + ")"
-                    : "Connecting to " + signup.HostAddress + "…", true);
+                    ? "Waiting on " + LanSession.LocalAddresses() + " (TCP " + LanSession.Port +
+                      ") — a phone on this hotspot finds you by itself. CANCEL leaves the wait."
+                    : "Connecting to " + address + "…", true);
             }
-            catch (System.Exception ex) when (ex is System.Net.Sockets.SocketException || ex is System.ArgumentException ||
-                                              ex is System.Net.NetworkInformation.NetworkInformationException)
+            catch (System.Exception ex)
             {
-                ReturnToMenu();
-                modes.SetNotice(ex.Message);
+                // Stay on the picker: it says what went wrong, and its own
+                // button starts the next attempt. The two failures a hotspot
+                // player actually hits - the phone's port is still busy after a
+                // previous session, or the address cannot be reached - get text
+                // that says what to do about them. Everything else is caught too:
+                // no press of this button may ever throw into the UI event and
+                // leave the screen looking dead.
+                FailOnPicker(mode == GameMode.LanHost
+                    ? $"Could not open TCP {LanSession.Port} on this phone ({ex.Message}). " +
+                      "Wait a moment, then press HOST BATTLE again."
+                    : $"Could not reach {address}:{LanSession.Port} ({ex.Message}). " +
+                      "Check both phones are on the same hotspot.");
             }
+        }
+
+        /// <summary>
+        /// A network attempt failed before a match began. The message belongs on
+        /// the picker the player is standing on, not on the mode screen they
+        /// were bounced back to - a silent drop out of the picker is what
+        /// "the host and join buttons do nothing" looks like.
+        /// </summary>
+        private void FailOnPicker(string reason)
+        {
+            Debug.LogError("[Network] " + reason);
+            CloseNetwork();
+            pickerError = reason;
+            signup.SetStatus(reason, false, true);
         }
 
         private void CloseNetwork()
@@ -366,6 +471,94 @@ namespace Arena
             network = null;
             handshake = false;
             remoteCasts.Clear();
+        }
+
+        private void CloseBeacon()
+        {
+            if (beacon == null) return;
+            Debug.Log("[Network] stopped shouting for a guest.");
+            beacon.Dispose();
+            beacon = null;
+        }
+
+        private void CloseFinder()
+        {
+            if (finder == null) return;
+            if (discoveredAddress != null) Debug.Log("[Network] stopped listening for hosts.");
+            finder.Dispose();
+            finder = null;
+        }
+
+        /// <summary>
+        /// Discovery, once per frame. A waiting host shouts its port on the
+        /// hotspot; a joining phone listens and fills the address field with
+        /// what it hears, so nobody has to read an address off one screen and
+        /// type it into the other.
+        ///
+        /// The picker's status line has three possible owners and the quietest
+        /// one wins: a session in progress (its own wait/connect text), then the
+        /// last failure, then discovery.
+        /// </summary>
+        private void StepDiscovery()
+        {
+            if (network != null && network.Active && network.IsHost && !handshake)
+            {
+                if (beacon == null)
+                {
+                    beacon = new LanBeacon(network.ListeningPort);
+                    if (beacon.Error != null) Debug.LogWarning("[Network] discovery beacon off: " + beacon.Error);
+                    else Debug.Log("[Network] shouting for a guest on UDP " + LanDiscovery.Port + ".");
+                }
+                beacon.Tick();
+            }
+            else CloseBeacon();
+
+            bool pickerUp = phase == Phase.Select && signup != null && signup.gameObject.activeSelf;
+            if (pickerUp && signup.Mode != pickerModeSeen)
+            {
+                // Host ⇄ join flipped: the failure that belonged to the old
+                // role is not this one's problem.
+                pickerModeSeen = signup.Mode;
+                pickerError = null;
+                signup.SetStatus(string.Empty, false);
+            }
+            if (!pickerUp || signup.Mode != GameMode.LanJoin)
+            {
+                CloseFinder();
+                discoveredAddress = null;
+                return;
+            }
+
+            if (network != null || pickerError != null) return;
+
+            if (finder == null)
+            {
+                finder = new LanFinder();
+                if (finder.Error != null)
+                {
+                    // Kept as the picker's failure, not rewritten next frame: a
+                    // phone that cannot listen is a real state, not a hint.
+                    Debug.LogWarning("[Network] " + finder.Error);
+                    pickerError = finder.Error + " — type the host's address instead.";
+                    signup.SetStatus(pickerError, false, true);
+                    return;
+                }
+                Debug.Log("[Network] listening for hosts on UDP " + LanDiscovery.Port + ".");
+            }
+
+            finder.Poll();
+            LanHost host = finder.Best;
+            if (host == null)
+            {
+                discoveredAddress = null;
+                signup.SetStatus("Searching the hotspot for a host — start hosting on the other phone, " +
+                    "or type its address.", false);
+                return;
+            }
+
+            discoveredAddress = host.Address;
+            signup.SetHostAddress(host.Address);
+            signup.SetStatus("Found host " + host.Address + " — press JOIN BATTLE.", false);
         }
 
         private void OnNetworkMessage(LanMessage message)
@@ -431,7 +624,7 @@ namespace Arena
         }
 
         private static bool ValidCharacter(CharacterId id) =>
-            id == CharacterId.Vanguard || id == CharacterId.Storm || id == CharacterId.Assassin;
+            id == CharacterId.Vanguard || id == CharacterId.Mage || id == CharacterId.Assassin;
         private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
         private static bool Finite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
         private static bool ValidSnapshot(LanMessage message)
@@ -439,6 +632,8 @@ namespace Arena
             bool Fighter(FighterSnapshot f) => f != null && Finite(f.position) && Finite(f.forward) &&
                 Finite(f.health) && f.health >= 0f && f.health <= GameConfig.MaxHealth &&
                 Finite(f.haste) && f.haste >= 0f && f.haste <= GameConfig.HasteMaxSeconds &&
+                Finite(f.hasteSpeed) && f.hasteSpeed >= 0f && f.hasteSpeed <= GameConfig.HasteMaxSpeed &&
+                Finite(f.hasteGrip) && f.hasteGrip >= 0f && f.hasteGrip <= GameConfig.HasteMaxGrip &&
                 f.cooldowns != null && f.cooldowns.Length == 3 &&
                 System.Array.TrueForAll(f.cooldowns, c => Finite(c) && c >= 0f);
             var s = message.snapshot;
@@ -465,6 +660,13 @@ namespace Arena
             if (session.Error != null)
             {
                 string error = session.Error;
+                if (phase == Phase.Select)
+                {
+                    // The player never left the picker, so the failure belongs
+                    // there, with the button ready for another go.
+                    FailOnPicker(error);
+                    return;
+                }
                 Debug.LogError("[Network] " + error);
                 ReturnToMenu();
                 modes.SetNotice(error);
@@ -608,6 +810,8 @@ namespace Arena
         {
             CancelInvoke();
             network?.Dispose();
+            beacon?.Dispose();
+            finder?.Dispose();
             sim?.Clear();
         }
 
@@ -633,6 +837,7 @@ namespace Arena
             }
 
             StepNetwork();
+            StepDiscovery();
             // Guests ease between snapshots so 60fps rendering never shows
             // the snapshot cadence; the host already ticks at 60Hz.
             if (IsGuest && sim != null) sim.AdvanceSnapshotView(Time.deltaTime);

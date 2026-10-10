@@ -88,10 +88,10 @@ namespace Arena.Gameplay
         private double accumulatedTime;
 
         /// <summary>
-        /// Damage the world still owes: a line spell that has laid down its ground
+        /// Damage the world still owes: an area spell that has laid down its ground
         /// warning but has not landed yet. The origin and direction are frozen at
-        /// cast time, so walking out of the corridor before the timer runs out is
-        /// exactly what dodging means.
+        /// cast time, so walking out of the warned ground before the timer runs out
+        /// is exactly what dodging means.
         /// </summary>
         private readonly List<PendingStrike> pending = new List<PendingStrike>();
 
@@ -99,13 +99,16 @@ namespace Arena.Gameplay
         {
             public FighterSim Caster;
             public AbilityDef Ability;
-            public Vector3 Origin;
             public Vector3 Forward;
+            /// <summary>Vortex-only: how far down the lane the funnel travels.</summary>
             public float Length;
-            public float Width;
+            /// <summary>Rift-only: the radius of the ring the ground opens inside.</summary>
+            public float Radius;
             public float Timer;
             /// <summary>True for the Vortex: the impact throws a travelling hazard.</summary>
             public bool Thrown;
+            /// <summary>True for the Earthrift: the warning and the hit ride the caster.</summary>
+            public bool Ring;
         }
 
         // Guest view smoothing. The guest has no prediction: it renders what
@@ -246,6 +249,9 @@ namespace Arena.Gameplay
             // flies the right way even before anyone moves.
             all.Add(local);
             all.Add(foe);
+            // The effects layer attributes a thrown prop to a slot, so it needs the
+            // roster in the same order the snapshots use.
+            fx.Track(all);
             Vector3 opening = foe.Position - local.Position;
             opening.y = 0f;
             if (opening.sqrMagnitude > 0.0001f)
@@ -326,6 +332,9 @@ namespace Arena.Gameplay
 
             TickStrikes(dt);
             fx.TickProjectiles(dt, all);
+            // Whose weapon is in the air right now: their hand stays empty until it
+            // comes home, which is the point of throwing your own shield.
+            fx.SyncProps();
             fx.TickVortices(dt, all);
             for (int i = 0; i < all.Count; i++)
                 for (int j = i + 1; j < all.Count; j++)
@@ -449,8 +458,9 @@ namespace Arena.Gameplay
 
         /// <summary>
         /// Fires a slot for <paramref name="caster"/>. Returns false when the
-        /// cast was rejected (stunned, dead or still on cooldown), so the HUD
-        /// only starts a cooldown bar for real casts.
+        /// cast was rejected (stunned, dead, still on cooldown, or with nobody
+        /// left to aim at), so the HUD only starts a cooldown bar for real casts
+        /// and a refusal never spends the slot.
         /// </summary>
         public bool Cast(FighterSim caster, int slot)
         {
@@ -458,10 +468,12 @@ namespace Arena.Gameplay
             if (slot < 0 || slot > 2 || caster.Cooldowns[slot] > 0f) return false;
 
             AbilityDef ab = caster.Def.Get((AbilitySlot)slot);
-            caster.Cooldowns[slot] = ab.Cooldown;
 
             FighterSim target = NearestOpponent(caster);
             if (target == null) return false;
+            // Committed only once the spell has somewhere to land: a cast the sim
+            // refuses must not leave the slot on cooldown for a spell that never ran.
+            caster.Cooldowns[slot] = ab.Cooldown;
             Vector3 fwd = caster.Forward.sqrMagnitude > 0.0001f
                 ? caster.Forward
                 : Vector3.forward;
@@ -520,7 +532,7 @@ namespace Arena.Gameplay
 
                 case "earthrift":
                     // The crack opens after a ground warning, so whoever is standing
-                    // in the corridor still has time to step out of it.
+                    // on the ring still has time to step out of it.
                     QueueStrike(caster, ab, fwd, false);
                     break;
 
@@ -553,32 +565,32 @@ namespace Arena.Gameplay
         }
 
         /// <summary>
-        /// Lays down the warning a line spell gives before it lands. Nothing is
+        /// Lays down the warning an area spell gives before it lands. Nothing is
         /// spawned here beyond the warning itself: the strike is resolved when its
-        /// timer runs out, against whoever is still standing in the corridor.
+        /// timer runs out, against whoever is still standing on the warned ground.
         /// </summary>
         private void QueueStrike(FighterSim caster, AbilityDef ab, Vector3 fwd, bool thrown)
         {
-            float length = ab.LineLength > 0f ? ab.LineLength : ab.Range;
-            float halfWidth = thrown ? ab.HazardRadius * 0.5f : ab.RiftWidth;
             // A thrown vortex is carried, not called down: the funnel gathers
             // under the caster's feet and is thrown from there, so its telegraph
             // is the wind-up itself rather than a corridor painted on the ground.
+            // The Earthrift is the other way round - the ring is drawn around the
+            // caster and the caster carries it, so the Vanguard stands in the middle
+            // of his own circle for the whole warning and the ground opens there.
             if (thrown)
                 fx.SpawnCharge(caster, ab.HazardRadius, caster.Def.Color, ab.Telegraph);
             else
-                fx.SpawnWarning(caster.Position, fwd, length, halfWidth * 2f,
-                    caster.Def.Color, ab.Telegraph);
+                fx.SpawnRingWarning(caster, ab.Range, caster.Def.Color, ab.Telegraph);
             pending.Add(new PendingStrike
             {
                 Caster = caster,
                 Ability = ab,
-                Origin = caster.Position,
                 Forward = fwd,
-                Length = length,
-                Width = halfWidth,
+                Length = thrown ? (ab.LineLength > 0f ? ab.LineLength : ab.Range) : 0f,
+                Radius = thrown ? 0f : ab.Range,
                 Timer = Mathf.Max(0.01f, ab.Telegraph),
-                Thrown = thrown
+                Thrown = thrown,
+                Ring = !thrown
             });
         }
 
@@ -595,18 +607,23 @@ namespace Arena.Gameplay
                 {
                     fx.SpawnVortex(strike.Caster, strike.Ability, strike.Forward, strike.Length);
                 }
-                else
+                else if (strike.Ring)
                 {
-                    fx.SpawnRift(strike.Origin, strike.Forward, strike.Length, strike.Width,
+                    // The ring is the caster's own circle, so it lands where they are
+                    // standing now rather than where they stood when they cast it: a
+                    // Vanguard who walks into the fight carries the crack with him.
+                    Vector3 centre = strike.Caster.Position;
+                    fx.SpawnRift(centre, strike.Radius, strike.Ability.RiftBand,
                         strike.Caster.Def.Color);
-                    // The corridor is the hit: everyone still inside it when the
-                    // ground opens takes the launch, not just the nearest fighter.
+                    // The disc is the hit: everyone inside the ring when the ground
+                    // opens takes the launch, thrown outward from the fighter in the
+                    // middle of it - never the caster himself, who is standing there.
                     for (int f = 0; f < all.Count; f++)
                     {
                         FighterSim victim = all[f];
                         if (victim == strike.Caster || victim.Dead) continue;
-                        CombatResolver.TryLineHit(strike.Origin, victim, strike.Ability,
-                            strike.Forward, strike.Length, strike.Width);
+                        CombatResolver.TryCircleHit(centre, victim, strike.Ability,
+                            strike.Radius);
                     }
                 }
 
@@ -644,6 +661,9 @@ namespace Arena.Gameplay
             snapshot.host.Apply(local);
             snapshot.guest.Apply(foe);
             fx.SyncReplicated(snapshot.effects);
+            // The replica of a prop in the air empties the same hand on this machine
+            // that it did on the host's.
+            fx.SyncProps();
         }
 
         /// <summary>

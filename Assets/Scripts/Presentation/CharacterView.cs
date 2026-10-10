@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
@@ -6,17 +7,20 @@ using Arena.Core;
 namespace Arena.Presentation
 {
     /// <summary>
-    /// Procedural 3D fighter built from primitives: a two-tone body (trunk,
-    /// head orb, swinging arms and legs, and a silhouette of extras that differs
-    /// per character), a forward-facing crest that doubles as the facing arrow,
-    /// a hit-flash shell, and a floating nameplate above the head that carries
-    /// the character's English name, a rounded health bar and a live percentage.
+    /// A fighter on the sand: the character's rigged model from
+    /// Resources/Arena/Fighters when it is there (see <see cref="FighterModel"/>),
+    /// and otherwise the procedural primitive body this view started as - a
+    /// two-tone trunk, head orb, swinging arms and legs, a silhouette of extras per
+    /// character and a forward-facing crest. Either way it carries a hit-flash, and
+    /// a floating nameplate above the head with the character's English name, a
+    /// rounded health bar and a live percentage.
     ///
     /// The body animates itself: a stride cycle driven by how fast the view is
-    /// actually travelling, an idle breath at rest, a hit recoil, and a cast
-    /// pose raised by <see cref="PlayCast"/>. Distance travelled is read back off
-    /// the transform, so a guest view interpolating between host snapshots walks
-    /// exactly like the host's.
+    /// actually travelling, an idle sway at rest, a hit recoil, and a cast pose
+    /// raised by <see cref="PlayCast"/>. On a model those are bone rotations; on the
+    /// primitives they are part rotations. Distance travelled is read back off the
+    /// transform, so a guest view interpolating between host snapshots walks exactly
+    /// like the host's.
     ///
     /// The nameplate is a world-space Canvas (uGUI), not mesh text: the menu
     /// and HUD already prove uGUI renders correctly here, so the same rounded
@@ -36,7 +40,19 @@ namespace Arena.Presentation
 
         // --- head nameplate, in canvas units (100 units == 1 world unit) ---
         private const float UnitsPerWorldUnit = 100f;
-        private const float HeadWidgetY = 2.65f;
+
+        /// <summary>
+        /// Height of the nameplate's anchor above the fighter's feet, in world units.
+        /// It reads high for a 1.9 m figure because of the pitch: the plate turns to
+        /// face the camera, so its local up *is* the screen's up, and a metre of world
+        /// height is only <c>cos(CameraPitch)</c> (0.53) up the screen. The health bar
+        /// hangs from the canvas's lower edge - about 0.64 screen units below this
+        /// anchor - so an anchor of 2.65 left the bar's bottom below the crown on
+        /// screen and the head was covered by it. 3.85 keeps the bar's bottom 0.29 m
+        /// (mage, staff included) to 0.38 m above the tallest fighter's top, measured
+        /// in screen units, and it is asserted in the regression suite.
+        /// </summary>
+        private const float HeadWidgetY = 3.85f;
         private const float CanvasWidth = 360f;
         private const float CanvasHeight = 132f;
         private const float PillWidth = 340f;
@@ -45,9 +61,17 @@ namespace Arena.Presentation
         private const float PercentFontSize = 46f;
 
         private Renderer[] renderers;
+        private Renderer[] bodyRenderers;
+        private FighterModel model;
         private MaterialPropertyBlock block;
         private Transform head;
         private Transform crest;
+
+        /// <summary>The rigged model this fighter is wearing, or null.</summary>
+        public FighterModel Model => model;
+
+        /// <summary>The rigged model loaded and bound to a poseable skeleton.</summary>
+        public bool HasModel => model != null && model.Ready;
 
         // --- animated body parts, all under BodyRoot ---
         private Transform torso;
@@ -77,13 +101,53 @@ namespace Arena.Presentation
 
         // --- Frost Aegis bubble, built on first use ---
         private Transform shield;
+        private Transform shieldRing;
+        private Material shieldDome;
+        private float shieldSize = 1f;
+        private float shieldWas;
+        private float shieldSoak;
+        private const float ShieldSoakSeconds = 0.30f;
 
-        // --- Shadowstep aura, built on first use ---
+        /// <summary>
+        /// The aegis reads gold, not ice: the Vanguard's own palette is the cold one,
+        /// so the barrier laid over the fighter is the single warm thing on it, and a
+        /// hit the aegis eats flashes it brighter - the only feedback that says the
+        /// damage was soaked rather than taken.
+        /// </summary>
+        private static readonly Color AegisGold = new Color(1f, 0.84f, 0.18f, 0.32f);
+        private static readonly Color AegisGoldFlash = new Color(1f, 0.95f, 0.55f, 0.72f);
+        private static readonly Color AegisStud = new Color(1f, 0.93f, 0.45f, 0.85f);
+
+        // --- Shadowstep aura and its red line, built on first use ---
         private Transform hasteAura;
         private float hasteLeft;
         private float hasteMax;
 
+        /// <summary>
+        /// Shadowstep is the assassin's dash, so it reads red: the same crimson as his
+        /// kit, kept here rather than taken from the character's palette because the
+        /// red line is the buff's mark and must stay red on any fighter who gets one.
+        /// The colour is shared with <see cref="RedTrail"/>, which drags the shorter
+        /// version of this line behind the assassin's thrown knives.
+        /// </summary>
+        private static readonly Color ShadowStepRed = RedTrail.LineRed;
+        private const float TrailHeight = 0.045f;   // just clear of the sand
+        private const float TrailWidth = 0.16f;
+        private const float TrailThickness = 0.02f;
+        private const float TrailMaxSpan = 1.1f;    // the line stays short
+        private const float TrailStep = 0.75f;      // metres travelled between dashes
+        private const float TrailFade = 0.30f;      // seconds a dash stays visible
+        private const int TrailSegments = 14;
+        private readonly Transform[] trail = new Transform[TrailSegments];
+        private readonly float[] trailAge = new float[TrailSegments];
+        private Transform trailHolder;
+        private int trailNext;
+        private Vector3 trailAnchor;
+        private bool trailHasAnchor;
+        private Material trailMaterial;
+
         private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
+        private static readonly int ColorId = Shader.PropertyToID("_Color");
         private static readonly int EmissionId = Shader.PropertyToID("_EmissionColor");
 
         public CharacterDef Definition => def;
@@ -108,6 +172,18 @@ namespace Arena.Presentation
         private void CacheRenderers()
         {
             renderers = GetComponentsInChildren<Renderer>(true);
+            if (model == null)
+            {
+                bodyRenderers = renderers;
+                return;
+            }
+
+            // The palette and the hit flash paint the primitive body by part name;
+            // the model keeps its own 9-17 materials, so it is left out of both.
+            var body = new List<Renderer>();
+            foreach (var r in renderers)
+                if (r != null && !r.transform.IsChildOf(model.transform)) body.Add(r);
+            bodyRenderers = body.ToArray();
         }
 
         private void OnValidate()
@@ -122,9 +198,9 @@ namespace Arena.Presentation
         private void ApplyPalette()
         {
             if (renderers == null || renderers.Length == 0) CacheRenderers();
-            if (renderers == null) return;
+            if (bodyRenderers == null) return;
 
-            foreach (var r in renderers)
+            foreach (var r in bodyRenderers)
             {
                 if (r == null) continue;
                 string n = r.gameObject.name;
@@ -153,6 +229,38 @@ namespace Arena.Presentation
             block.SetColor(BaseColorId, c);
             block.SetColor(EmissionId, c * 0.35f);
             r.SetPropertyBlock(block);
+        }
+
+        /// <summary>
+        /// A world point on the fighter for a throw to leave from: the model's own
+        /// bone when it has one, and otherwise `fallback`, which is the primitive
+        /// body's approximation - so a fighter whose art has not landed throws from
+        /// exactly where it always did.
+        /// </summary>
+        public Vector3 Anchor(FighterAnchor anchor, Vector3 fallback)
+        {
+            if (model == null) return fallback;
+            Vector3 point;
+            return model.TryAnchor(anchor, out point) ? point : fallback;
+        }
+
+        /// <summary>
+        /// True when this fighter is wearing the real prop for a thrown shape - the
+        /// shield on the arm or the knife in the fist. When it is false the throw is
+        /// drawn as the procedural slab, which is all a fighter with no model has.
+        /// </summary>
+        public bool HasProp(ProjectileShape shape)
+            => model != null && model.Prop(PropLibrary.WireId(shape)) != null;
+
+        /// <summary>
+        /// Takes the worn prop away, or gives it back. Gameplay hides it for exactly as
+        /// long as a copy is in the air, so the hand empties when the weapon leaves and
+        /// fills again when it comes home - or when it is lost.
+        /// </summary>
+        public void SetPropHidden(ProjectileShape shape, bool hidden)
+        {
+            if (model == null) return;
+            model.SetPropHidden(PropLibrary.WireId(shape), hidden);
         }
 
         /// <summary>Called by gameplay when this fighter takes damage.</summary>
@@ -221,13 +329,22 @@ namespace Arena.Presentation
             if (remaining <= 0f || max <= 0f || def == null)
             {
                 if (shield != null) shield.gameObject.SetActive(false);
+                shieldWas = 0f;
+                shieldSoak = 0f;
                 return;
             }
 
             if (shield == null) shield = BuildShield();
             shield.gameObject.SetActive(true);
-            float scale = Mathf.Lerp(1.02f, 1.55f, Mathf.Clamp01(remaining / max));
-            shield.localScale = new Vector3(scale, scale * 1.25f, scale);
+
+            // A soak is the shield dropping between two reports - the one moment the
+            // aegis has something to say - so it flashes gold for it. A guest sees the
+            // same drop in the replicated shield value and flashes with the host.
+            if (shieldWas > 0.01f && remaining < shieldWas - 0.01f) shieldSoak = ShieldSoakSeconds;
+            shieldWas = remaining;
+            // Size comes from the shield that is left; the breathing and the flash
+            // ride on top of it in AnimateShield.
+            shieldSize = Mathf.Lerp(1.02f, 1.55f, Mathf.Clamp01(remaining / max));
         }
 
         /// <summary>
@@ -244,14 +361,20 @@ namespace Arena.Presentation
 
         /// <summary>
         /// The buff's read: a ring of dashes orbiting the feet that tightens as
-        /// the timer runs out. Built lazily, so a fighter who never buffs pays
-        /// nothing for it.
+        /// the timer runs out, plus the short red line the dash leaves behind it.
+        /// Built lazily, so a fighter who never buffs pays nothing for it.
+        ///
+        /// The line is laid down along the *path* rather than glued to the fighter,
+        /// which is also why it survives the trip over the wire: it is dropped from
+        /// the distance the view itself travelled, and a guest view walks the same
+        /// distance between the same replicated snapshots.
         /// </summary>
         private void AnimateHaste()
         {
             if (hasteLeft <= 0f)
             {
                 if (hasteAura != null) hasteAura.gameObject.SetActive(false);
+                trailHasAnchor = false;
                 return;
             }
 
@@ -263,6 +386,98 @@ namespace Arena.Presentation
             float size = (0.8f + 0.4f * left) * pulse;
             hasteAura.localScale = new Vector3(size, 1f, size);
             hasteAura.Rotate(0f, 260f * Time.deltaTime, 0f, Space.Self);
+
+            // The line is laid down every TrailStep metres of travel, so a fighter who
+            // stands still under the buff draws nothing - the mark is the dash, not
+            // the timer.
+            var here = new Vector3(transform.position.x, TrailHeight, transform.position.z);
+            if (!trailHasAnchor)
+            {
+                trailAnchor = here;
+                trailHasAnchor = true;
+            }
+            else
+            {
+                Vector3 travelled = here - trailAnchor;
+                if (travelled.sqrMagnitude < TrailStep * TrailStep) return;
+                DropTrail(trailAnchor, travelled.normalized, travelled.magnitude);
+                trailAnchor = here;
+            }
+        }
+
+        /// <summary>Lays one dash of the red line down where the fighter just was.</summary>
+        private void DropTrail(Vector3 from, Vector3 dir, float length)
+        {
+            if (dir.sqrMagnitude < 0.0001f || length < 0.01f) return;
+            float span = Mathf.Min(length, TrailMaxSpan);
+            var seg = trail[trailNext];
+            if (seg == null)
+            {
+                var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                DestroyComponent(go.GetComponent<Collider>());
+                go.name = "ShadowTrail";
+                // The line marks the ground, so the dashes sit under a holder that does
+                // not move: parented to the fighter they would slide along with him.
+                go.transform.SetParent(TrailHolder(), false);
+                if (trailMaterial == null)
+                    trailMaterial = OwnedMaterial.TransparentUnlit(ShadowStepRed);
+                go.GetComponent<Renderer>().sharedMaterial = trailMaterial;
+                seg = go.transform;
+                trail[trailNext] = seg;
+            }
+
+            seg.gameObject.SetActive(true);
+            seg.position = from + dir * (span * 0.5f);
+            seg.rotation = Quaternion.LookRotation(dir, Vector3.up);
+            seg.localScale = new Vector3(TrailWidth, TrailThickness, span);
+            trailAge[trailNext] = TrailFade;
+            trailNext = (trailNext + 1) % TrailSegments;
+        }
+
+        private Transform TrailHolder()
+        {
+            if (trailHolder != null) return trailHolder;
+            var go = new GameObject("ShadowTrailLine");
+            go.transform.SetParent(transform.parent, false);
+            trailHolder = go.transform;
+            return trailHolder;
+        }
+
+        /// <summary>Fades the dashes out, each one where it was laid down.</summary>
+        private void AnimateTrail()
+        {
+            for (int i = 0; i < trail.Length; i++)
+            {
+                var seg = trail[i];
+                if (seg == null || trailAge[i] <= 0f) continue;
+                trailAge[i] = Mathf.Max(0f, trailAge[i] - Time.deltaTime);
+                float k = trailAge[i] / TrailFade;
+                if (k <= 0f)
+                {
+                    seg.gameObject.SetActive(false);
+                    continue;
+                }
+                seg.localScale = new Vector3(
+                    TrailWidth * (0.35f + 0.65f * k), TrailThickness, seg.localScale.z);
+                block.SetColor(BaseColorId, new Color(
+                    ShadowStepRed.r, ShadowStepRed.g, ShadowStepRed.b, ShadowStepRed.a * k));
+                var r = seg.GetComponent<Renderer>();
+                r.SetPropertyBlock(block);
+            }
+        }
+
+        private void OnDestroy()
+        {
+            if (trailHolder != null)
+            {
+                if (Application.isPlaying) Destroy(trailHolder.gameObject);
+                else DestroyImmediate(trailHolder.gameObject);
+                trailHolder = null;
+            }
+            if (trailMaterial == null) return;
+            if (Application.isPlaying) Destroy(trailMaterial);
+            else DestroyImmediate(trailMaterial);
+            trailMaterial = null;
         }
 
         private Transform BuildHasteAura()
@@ -271,7 +486,7 @@ namespace Arena.Presentation
             root.transform.SetParent(transform, false);
             root.transform.localPosition = new Vector3(0f, 0.03f, 0f);
 
-            Color tint = def.ColorLight;
+            Color tint = ShadowStepRed;
             var disc = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
             DestroyComponent(disc.GetComponent<Collider>());
             disc.name = "HasteDisc";
@@ -299,17 +514,73 @@ namespace Arena.Presentation
             return root.transform;
         }
 
+        /// <summary>
+        /// Drives the aegis: it breathes by a couple of percent while it holds, its
+        /// crown of studs orbits, and a soak swells and brightens the dome, so the
+        /// gold flash is the read that the shield ate the hit.
+        /// </summary>
+        private void AnimateShield()
+        {
+            if (shield == null || !shield.gameObject.activeSelf) return;
+
+            float soak = 0f;
+            if (shieldSoak > 0f)
+            {
+                soak = Mathf.Clamp01(shieldSoak / ShieldSoakSeconds);
+                shieldSoak = Mathf.Max(0f, shieldSoak - Time.deltaTime);
+            }
+
+            float breathe = 1f + 0.02f * Mathf.Sin(Time.time * 3.4f);
+            float scale = shieldSize * breathe * (1f + 0.16f * soak);
+            shield.localScale = new Vector3(scale, scale, scale);
+            if (shieldRing != null) shieldRing.Rotate(0f, 130f * Time.deltaTime, 0f, Space.Self);
+            if (shieldDome == null) return;
+
+            Color c = Color.Lerp(AegisGold, AegisGoldFlash, soak);
+            if (shieldDome.HasProperty(BaseColorId)) shieldDome.SetColor(BaseColorId, c);
+            if (shieldDome.HasProperty(ColorId)) shieldDome.SetColor(ColorId, c);
+        }
+
+        /// <summary>
+        /// The aegis itself: a gold dome over the fighter with a crown of studs
+        /// orbiting its equator. The dome is what soaks; the crown is what makes it
+        /// read as hardware standing in the air instead of a tinted ball, and it
+        /// turns while the dome breathes, so the barrier never looks frozen.
+        /// </summary>
         private Transform BuildShield()
         {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            DestroyComponent(go.GetComponent<Collider>());
-            go.name = "ShieldBubble";
-            go.transform.SetParent(transform, false);
-            go.transform.localPosition = new Vector3(0f, 1.15f, 0f);
-            Color tint = def.ColorLight;
-            OwnedMaterial.Assign(go, OwnedMaterial.TransparentUnlit(
-                new Color(tint.r, tint.g, tint.b, 0.30f)));
-            return go.transform;
+            var root = new GameObject("ShieldBubble");
+            root.transform.SetParent(transform, false);
+            root.transform.localPosition = new Vector3(0f, 1.15f, 0f);
+
+            var dome = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            DestroyComponent(dome.GetComponent<Collider>());
+            dome.name = "ShieldDome";
+            dome.transform.SetParent(root.transform, false);
+            // Taller than wide, and the crown rides the sphere's real radius: the
+            // primitive is one unit across, so a stud at 0.5 sits on the surface.
+            dome.transform.localScale = new Vector3(1f, 1.25f, 1f);
+            OwnedMaterial.Assign(dome, OwnedMaterial.TransparentUnlit(AegisGold));
+            shieldDome = dome.GetComponent<OwnedMaterial>().Material;
+
+            var ring = new GameObject("ShieldRing");
+            ring.transform.SetParent(root.transform, false);
+            for (int i = 0; i < 8; i++)
+            {
+                float angle = i * (Mathf.PI * 2f / 8f);
+                var stud = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                DestroyComponent(stud.GetComponent<Collider>());
+                stud.name = "ShieldStud";
+                stud.transform.SetParent(ring.transform, false);
+                stud.transform.localPosition =
+                    new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle)) * 0.5f;
+                stud.transform.localRotation = Quaternion.Euler(0f, angle * Mathf.Rad2Deg, 0f);
+                stud.transform.localScale = new Vector3(0.10f, 0.05f, 0.30f);
+                OwnedMaterial.Assign(stud, OwnedMaterial.TransparentUnlit(AegisStud));
+            }
+            shieldRing = ring.transform;
+
+            return root.transform;
         }
 
         public void SetVisible(bool visible)
@@ -338,6 +609,8 @@ namespace Arena.Presentation
 
             AnimateBody();
             AnimateHaste();
+            AnimateTrail();
+            AnimateShield();
 
             if (bodyRoot != null)
             {
@@ -348,11 +621,14 @@ namespace Arena.Presentation
                 bodyRoot.localPosition = new Vector3(0f, baseY + bob + bounce, 0f);
             }
 
+            if (model != null)
+                model.SetFlash(hitFlash > 0f ? Mathf.Clamp01(hitFlash / HitFlashSeconds) : 0f);
+
             if (hitFlash > 0f)
             {
                 hitFlash -= Time.deltaTime;
                 float k = Mathf.Clamp01(hitFlash / HitFlashSeconds);
-                foreach (var r in renderers)
+                foreach (var r in bodyRenderers)
                 {
                     if (r == null) continue;
                     string n = r.gameObject.name;
@@ -433,6 +709,11 @@ namespace Arena.Presentation
                 torso.localScale = new Vector3(torsoScaleHome.x,
                     torsoScaleHome.y * breath, torsoScaleHome.z);
             }
+
+            // The same four numbers, as bone rotations, when this fighter wears the
+            // rigged model instead of the primitive body.
+            if (model != null)
+                model.Pose(stridePhase, gait, cast, recoil, Time.time + bobSeed);
         }
 
         private void LateUpdate()
@@ -462,6 +743,22 @@ namespace Arena.Presentation
             var body = new GameObject("BodyRoot");
             body.transform.SetParent(root.transform, false);
             view.bodyRoot = body.transform;
+
+            // The rigged model carries the body when it is in Resources; the
+            // primitives below are then only what the overhead read still needs, so
+            // a missing model degrades to the prototype look instead of a blank unit.
+            view.model = FighterModel.Attach(body.transform, def.Id);
+            if (view.model != null)
+            {
+                // Ground badge - a thin disc that keeps the unit planted on the ice.
+                AddPart(body.transform, PrimitiveType.Cylinder, "Badge",
+                    new Vector3(0f, 0.05f, 0f), new Vector3(1.7f, 0.04f, 1.7f));
+                BuildNameplate(root.transform, view);
+                view.Configure(def, position);
+                view.CacheRenderers();
+                view.ApplyPalette();
+                return view;
+            }
 
             // --- trunk ---
             view.torso = AddPart(body.transform, PrimitiveType.Capsule, "Torso",
@@ -503,7 +800,7 @@ namespace Arena.Presentation
 
         /// <summary>
         /// Per-character extras, so the two fighters tell apart at a glance under
-        /// the overhead camera: the Vanguard is a slab of plate armour, the Storm
+        /// the overhead camera: the Vanguard is a slab of plate armour, the Mage
         /// mage is a robed caster.
         /// </summary>
         private static void AddSilhouette(Transform body, CharacterDef def)

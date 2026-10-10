@@ -61,8 +61,14 @@ namespace Arena.Gameplay
 
         public static LanSession Join(string address, int port = Port)
         {
-            if (!IPAddress.TryParse(address.Trim(), out var ip) || ip.AddressFamily != AddressFamily.InterNetwork)
-                throw new ArgumentException("Enter the host's IPv4 address (for example 192.168.43.1).");
+            // Never dereference the caller's string: a phone that presses JOIN
+            // with an empty address used to throw a NullReferenceException out
+            // of the button press and look like a crash.
+            string entered = address == null ? string.Empty : address.Trim();
+            if (entered.Length == 0)
+                throw new ArgumentException("Please enter the host's IP address (for example 192.168.43.1).");
+            if (!IPAddress.TryParse(entered, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork)
+                throw new ArgumentException("\"" + entered + "\" is not a host address. Enter the host's IPv4 address (for example 192.168.43.1).");
             var s = new LanSession();
             try
             {

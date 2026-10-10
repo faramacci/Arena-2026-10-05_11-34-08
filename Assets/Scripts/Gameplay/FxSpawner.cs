@@ -19,11 +19,23 @@ namespace Arena.Gameplay
         private readonly List<RingFx> rings = new List<RingFx>();
         private readonly List<RiftFx> rifts = new List<RiftFx>();
         private readonly List<WarningFx> warnings = new List<WarningFx>();
-        private readonly List<GameObject> replicatedEffects = new List<GameObject>();
+        private readonly List<Replica> replicatedEffects = new List<Replica>();
+
+        /// <summary>
+        /// The match's fighters in snapshot slot order - 0 is the local player, 1 the
+        /// fighter the LAN path mirrors - handed over by the sim. An effect snapshot
+        /// names the thrower by that slot, which is what lets the guest take the worn
+        /// prop off the same arm the host did.
+        /// </summary>
+        private IList<FighterSim> roster;
+
         private GameObject fxRoot;
 
         private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
+        private static readonly int ColorId = Shader.PropertyToID("_Color");
         private static readonly Color RiftStone = new Color(0.17f, 0.18f, 0.23f);
+        /// <summary>The hole itself: darker than the broken plates beside it.</summary>
+        private static readonly Color RiftVoid = new Color(0.05f, 0.05f, 0.08f);
         private static Shader fxShader;
         private static Material fxMaterialTemplate;
 
@@ -59,16 +71,80 @@ namespace Arena.Gameplay
         {
             ProjectileShape shape = ab.ProjectileShape;
             bool orb = shape == ProjectileShape.Orb;
-            var go = GameObject.CreatePrimitive(orb ? PrimitiveType.Sphere : PrimitiveType.Cube);
-            Object.Destroy(go.GetComponent<Collider>());
+            // The real prop, when there is one: the Vanguard's lion shield and the
+            // Assassin's knife are their own objects (see PropLibrary), so the throw is
+            // the thing the fighter is actually carrying rather than a slab standing in
+            // for it. Speed, lifetime and contact are the same either way, and a missing
+            // asset falls back to the slab.
+            int wire = PropLibrary.WireId(shape);
+            GameObject prop = PropLibrary.Fly(wire, ShapeName(shape));
+            var go = prop == null
+                ? GameObject.CreatePrimitive(orb ? PrimitiveType.Sphere : PrimitiveType.Cube)
+                : new GameObject(ShapeName(shape));
+            if (prop == null) Object.Destroy(go.GetComponent<Collider>());
             go.name = ShapeName(shape);
             go.transform.SetParent(FxRoot.transform, false);
-            go.transform.position =
-                caster.Position + Vector3.up * ShapeHeight(shape) + dir * 0.9f;
-            go.transform.localScale = ShapeScale(shape);
-            OwnedMaterial.Assign(go, MakeUnlit(orb
+            // Out of the hand that holds it, when the fighter is wearing a rig. The
+            // primitive body has no arm to read, so it keeps the old offset - which
+            // also has to clear the wider silhouette those capsules have.
+            bool rigged = caster.View != null && caster.View.HasModel;
+            go.transform.position = LaunchPoint(caster, shape) + dir * (rigged ? 0.30f : 0.9f);
+            Color tone = orb
                 ? caster.Def.ColorLight
-                : Color.Lerp(caster.Def.ColorLight, Color.white, 0.35f)));
+                : shape == ProjectileShape.Shield
+                    ? AegisGold
+                    : Color.Lerp(caster.Def.ColorLight, Color.white, 0.35f);
+            if (prop != null)
+            {
+                // The prop is modelled life size, so it is not scaled up the way the
+                // slab is: the shield in the air is the shield that was on the arm a
+                // frame ago, and it keeps its own materials and its own colours.
+                prop.transform.SetParent(go.transform, false);
+                prop.transform.localPosition = Vector3.zero;
+                prop.transform.localRotation = Quaternion.identity;
+            }
+            else
+            {
+                go.transform.localScale = ShapeScale(shape);
+                OwnedMaterial.Assign(go, MakeUnlit(tone));
+            }
+
+            // An orb is not a ball: it crackles. The crackle has to survive the wire,
+            // and a snapshot carries position, scale and colour but no rotation, so the
+            // electricity is built from axis-aligned boxes and a halo - a breathing
+            // glow around the core and four bolts that shoot out and snap back - and
+            // every piece is captured per frame, which is what lets the guest draw the
+            // same crackle without a single extra field on the wire.
+            Transform glow = null;
+            Transform[] bolts = null;
+            if (orb)
+            {
+                var glowGo = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                Object.Destroy(glowGo.GetComponent<Collider>());
+                glowGo.name = "OrbGlow";
+                glowGo.transform.SetParent(go.transform, false);
+                glowGo.transform.localScale = Vector3.one * 1.7f;
+                OwnedMaterial.Assign(glowGo, OwnedMaterial.TransparentUnlit(
+                    new Color(tone.r, tone.g, tone.b, 0.32f)));
+                glow = glowGo.transform;
+
+                bolts = new Transform[4];
+                for (int i = 0; i < bolts.Length; i++)
+                {
+                    var bolt = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                    Object.Destroy(bolt.GetComponent<Collider>());
+                    bolt.name = "OrbBolt" + i;
+                    bolt.transform.SetParent(go.transform, false);
+                    bolt.transform.localScale = new Vector3(0.07f, 0.07f, 1f);
+                    OwnedMaterial.Assign(bolt, MakeUnlit(Color.Lerp(tone, Color.white, 0.7f)));
+                    bolts[i] = bolt.transform;
+                }
+            }
+
+            // The assassin's knives drag a short red line behind them - the same
+            // crimson the Shadowstep dash marks the sand with, cut to knife size
+            // (see RedTrail). The orb and the aegis are not knives and get none.
+            if (IsKnife(shape)) RedTrail.Attach(go);
 
             float speed = ab.ProjectileSpeed > 0f ? ab.ProjectileSpeed : GameConfig.OrbSpeed;
             projectiles.Add(new Projectile
@@ -80,10 +156,14 @@ namespace Arena.Gameplay
                 Life = ab.ProjectileLife > 0f ? ab.ProjectileLife : 1.5f,
                 Origin = go.transform.position,
                 Speed = speed,
-                Height = ShapeHeight(shape),
                 Spin = ShapeSpin(shape),
                 TurnAt = ab.ProjectileRange,
-                Touched = volley
+                Touched = volley,
+                Glow = glow,
+                Bolts = bolts,
+                Tone = tone,
+                Wire = wire,
+                Prop = prop
             });
         }
 
@@ -110,6 +190,22 @@ namespace Arena.Gameplay
             }
         }
 
+        /// <summary>
+        /// The aegis is gold in the hand and gold in the air: it is the same artifact
+        /// the Vanguard wears on its forearm, and CharacterView's Frost Aegis bubble
+        /// carries the same colour, so the slab reads as one shield leaving the arm
+        /// and coming back to it.
+        /// </summary>
+        private static readonly Color AegisGold = new Color(1f, 0.84f, 0.18f);
+
+        /// <summary>
+        /// Whether a throw is one of the assassin's knives. His knife and the blades
+        /// of his wave are the same prop (see <see cref="PropLibrary.WireId"/>), so
+        /// both drag the trail and nothing else does.
+        /// </summary>
+        private static bool IsKnife(ProjectileShape shape) =>
+            shape == ProjectileShape.Dagger || shape == ProjectileShape.Blade;
+
         private static string ShapeName(ProjectileShape shape) => shape switch
         {
             ProjectileShape.Blade => "Blade",
@@ -127,6 +223,30 @@ namespace Arena.Gameplay
             ProjectileShape.Shield => new Vector3(0.54f, 0.76f, 0.17f),
             _ => Vector3.one * 0.75f
         };
+
+        /// <summary>
+        /// Where a thrown weapon leaves the fighter. The rigs carry their equipment,
+        /// so the shapes are read off it: the aegis leaves the left forearm it is
+        /// strapped to, and the knives and the mage's orbs leave the right fist - the
+        /// hand the mage is not holding the staff in.
+        /// </summary>
+        private static FighterAnchor LaunchAnchor(ProjectileShape shape) => shape switch
+        {
+            ProjectileShape.Shield => FighterAnchor.LeftForearm,
+            _ => FighterAnchor.RightHand
+        };
+
+        /// <summary>
+        /// The point a throw starts from and comes home to, taken from the view every
+        /// time it is asked: with a rig the aegis is thrown from, and caught by, a
+        /// forearm that is still moving. Without one this is the old
+        /// height-over-the-body point, so nothing moves for a fighter with no model.
+        /// </summary>
+        private static Vector3 LaunchPoint(FighterSim owner, ProjectileShape shape)
+        {
+            Vector3 body = owner.Position + Vector3.up * ShapeHeight(shape);
+            return owner.View != null ? owner.View.Anchor(LaunchAnchor(shape), body) : body;
+        }
 
         private static float ShapeHeight(ProjectileShape shape) => shape switch
         {
@@ -165,11 +285,18 @@ namespace Arena.Gameplay
             // A tornado, not a pancake: bands stacked into a funnel that is widest
             // at the base and tightest at the top, each swirling at its own speed
             // so the silhouette twists as the whole thing travels.
-            AddFunnelBand(go.transform, bands, ab.HazardRadius * 2f, 0.80f, 0.40f,
+            //
+            // The base band stays exactly the hit diameter (2 * HazardRadius) - that
+            // is the promise that what you watch travel is what wounds you - and that
+            // diameter is now 9u rather than 12u, because the ability's own pull
+            // radius came down to 4.5. Above the base the funnel is slimmer still
+            // (the middle band is a quarter narrower) and about 29% shorter than the
+            // column of wind it started as.
+            AddFunnelBand(go.transform, bands, ab.HazardRadius * 2f, 0.62f, 0.32f,
                 caster.Def.Color, 340f, 0f);
-            AddFunnelBand(go.transform, bands, ab.HazardRadius * 1.4f, 1.50f, 1.25f,
+            AddFunnelBand(go.transform, bands, ab.HazardRadius * 1.05f, 1.10f, 0.95f,
                 caster.Def.Color, -470f, 1.9f);
-            AddFunnelBand(go.transform, bands, ab.HazardRadius * 0.8f, 2.30f, 2.60f,
+            AddFunnelBand(go.transform, bands, ab.HazardRadius * 0.6f, 1.60f, 1.85f,
                 caster.Def.ColorLight, 580f, 3.7f);
             SpawnRing(centre, ab.HazardRadius, caster.Def.ColorLight);
 
@@ -190,43 +317,59 @@ namespace Arena.Gameplay
         }
 
         /// <summary>
-        /// The ground warning a line spell lays down before it lands: a chain of
-        /// flat markers along the corridor, blinking faster as the strike closes
-        /// in. Markers rather than one long bar because snapshots carry no
-        /// rotation — the guest has to rebuild the same corridor from position,
-        /// scale and colour alone.
+        /// The ground warning the Earthrift lays down before it lands: the circle the
+        /// caster is standing in the middle of, marked by flat discs on its rim and by
+        /// two thinner rings inside it, blinking faster as the crack closes in. It is
+        /// drawn around the caster and follows them, so the circle a player watches
+        /// close on them is exactly the ground that opens.
+        ///
+        /// Discs rather than one ring mesh because snapshots carry no rotation — the
+        /// guest has to rebuild the same circle from position, scale and colour alone,
+        /// and a cylinder reads the same at every angle.
         /// </summary>
-        public void SpawnWarning(Vector3 origin, Vector3 dir, float length, float width,
-            Color color, float seconds)
+        public void SpawnRingWarning(FighterSim owner, float radius, Color color, float seconds)
         {
-            Vector3 flat = new Vector3(dir.x, 0f, dir.z);
-            flat = flat.sqrMagnitude > 0.0001f ? flat.normalized : Vector3.forward;
-
-            const int markers = 7;
             var root = new GameObject("SpellWarning");
             root.transform.SetParent(FxRoot.transform, false);
+            root.transform.position = owner.Position + Vector3.up * 0.04f;
 
-            var bar = new List<Transform>(markers);
-            for (int i = 0; i < markers; i++)
+            // Three bands - the rim that will crack, then two inside it, so the whole
+            // disc the spell covers is painted rather than only its edge. Every marker
+            // is the same size: the tick breathes them together, which is the blink.
+            float[] bandRadius = { radius, radius * 0.60f, radius * 0.26f };
+            int[] bandCount = { 14, 8, 4 };
+            float marker = radius * 0.30f;
+            int total = 0;
+            for (int b = 0; b < bandCount.Length; b++) total += bandCount[b];
+            var ring = new List<Transform>(total);
+            for (int b = 0; b < bandRadius.Length; b++)
             {
-                var marker = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                Object.Destroy(marker.GetComponent<Collider>());
-                marker.name = "Warn" + i;
-                marker.transform.SetParent(root.transform, false);
-                float along = length * ((i + 0.5f) / markers);
-                marker.transform.position = origin + flat * along + Vector3.up * 0.04f;
-                marker.transform.localScale = new Vector3(width, 0.04f, width);
-                OwnedMaterial.Assign(marker, MakeUnlit(color));
-                bar.Add(marker.transform);
+                for (int i = 0; i < bandCount[b]; i++)
+                {
+                    // Each band is offset by a fraction of its own step, so the markers
+                    // of one ring do not line up with the spokes of the next.
+                    float angle = (i + b * 0.45f) / bandCount[b] * Mathf.PI * 2f;
+                    var disc = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                    Object.Destroy(disc.GetComponent<Collider>());
+                    disc.name = "Warn" + b + "_" + i;
+                    disc.transform.SetParent(root.transform, false);
+                    disc.transform.localPosition = new Vector3(
+                        Mathf.Sin(angle) * bandRadius[b], 0f,
+                        Mathf.Cos(angle) * bandRadius[b]);
+                    disc.transform.localScale = new Vector3(marker, 0.04f, marker);
+                    OwnedMaterial.Assign(disc, MakeUnlit(color));
+                    ring.Add(disc.transform);
+                }
             }
 
             warnings.Add(new WarningFx
             {
                 Root = root.transform,
-                Markers = bar,
+                Markers = ring,
+                Follows = owner,
                 T = 0f,
                 Total = Mathf.Max(0.05f, seconds),
-                Width = width,
+                Width = marker,
                 Color = color
             });
         }
@@ -316,51 +459,107 @@ namespace Arena.Gameplay
         }
 
         /// <summary>
-        /// The Earthrift's crack: a line of stone plates that are already lifted
-        /// and tilted away from the ground, plus a glowing seam down the middle so
-        /// it still reads from the overhead camera. Purely visual — the damage and
-        /// the launch are applied once, by the cast.
+        /// The Earthrift's crack: a ring of stone plates lifted and tilted out of the
+        /// ground, with a dark seam and a glowing vein running round the circle they
+        /// break. The caster stands at the centre of it - the ring is their own
+        /// circle, and the disc inside it is the hit. Purely visual — the damage and
+        /// the launch are applied once, by the strike.
+        ///
+        /// The plates carry a yaw so they line up with the circle they trace, but the
+        /// shape has to survive the wire as well: a snapshot carries no rotation, so
+        /// each plate is kept near-square in plan and the guest, which draws every
+        /// piece axis-aligned, still sees a ring rather than a scatter of slats. The
+        /// band sits inside <paramref name="radius"/>, so the ground that breaks is the
+        /// ground that hits.
         /// </summary>
-        public void SpawnRift(Vector3 origin, Vector3 dir, float length, float width, Color color)
+        public void SpawnRift(Vector3 centre, float radius, float band, Color color)
         {
-            Vector3 flat = new Vector3(dir.x, 0f, dir.z);
-            flat = flat.sqrMagnitude > 0.0001f ? flat.normalized : Vector3.forward;
-
             var root = new GameObject("Rift");
             root.transform.SetParent(FxRoot.transform, false);
-            root.transform.position = origin;
-            root.transform.rotation = Quaternion.Euler(
-                0f, Mathf.Atan2(flat.x, flat.z) * Mathf.Rad2Deg, 0f);
+            root.transform.position = centre;
 
-            const int slabs = 6;
-            float step = length / slabs;
-            for (int i = 0; i < slabs; i++)
+            const int pieces = 12;
+            float step = Mathf.PI * 2f / pieces;
+            float ring = Mathf.Max(0.5f, radius - band * 0.5f);
+            float along = step * ring * 1.02f;      // tangential length: gaps just shut
+            float across = band * 0.78f;            // radial thickness of one plate
+            for (int i = 0; i < pieces; i++)
             {
-                // Plates are tallest around the middle of the crack.
-                float middle = 1f - Mathf.Abs(i - (slabs - 1) * 0.5f) / (slabs * 0.5f);
+                float angle = i * step;
+                var radial = new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle));
+                Vector3 spot = radial * ring;
+                // Patches of the ring stand taller than others, so it reads as a break
+                // rather than a machined hoop.
+                float lift = 0.5f + 0.5f * Mathf.Sin(i * 1.7f);
+
                 var slab = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 Object.Destroy(slab.GetComponent<Collider>());
                 slab.name = "RiftSlab" + i;
                 slab.transform.SetParent(root.transform, false);
-                slab.transform.localPosition = new Vector3(
-                    Mathf.Sin(i * 2.4f) * width * 0.16f, 0.05f, step * (i + 0.5f));
-                // The tilt is the read: broken ground, not a painted stripe.
+                slab.transform.localPosition = spot + new Vector3(0f, 0.05f + 0.05f * lift, 0f);
+                // The tilt is the read: broken ground, not a painted circle. The yaw
+                // turns the plate along its tangent, which puts its long local axis
+                // round the ring and its short one across it.
                 slab.transform.localRotation = Quaternion.Euler(
-                    Mathf.Sin(i * 2.7f) * 15f,
-                    Mathf.Cos(i * 1.9f) * 9f,
-                    Mathf.Sin(i * 3.1f) * 13f);
+                    Mathf.Sin(i * 2.7f) * 14f, angle * Mathf.Rad2Deg, Mathf.Sin(i * 3.1f) * 13f);
                 slab.transform.localScale = new Vector3(
-                    width * (0.85f + 0.30f * middle), 0.30f + 0.24f * middle, step * 0.90f);
+                    along, 0.24f + 0.24f * lift, across * (0.92f + 0.16f * lift));
                 OwnedMaterial.Assign(slab, MakeUnlit(RiftStone));
+
+                // The hole itself: flat discs butted together make one dark circle, and
+                // a disc survives the loss of its rotation on the way to a guest.
+                float disc = step * ring * 1.12f;
+                var seam = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                Object.Destroy(seam.GetComponent<Collider>());
+                seam.name = "RiftSeam" + i;
+                seam.transform.SetParent(root.transform, false);
+                seam.transform.localPosition = spot + new Vector3(0f, 0.03f, 0f);
+                seam.transform.localScale = new Vector3(disc, 0.05f, disc);
+                OwnedMaterial.Assign(seam, MakeUnlit(RiftVoid));
+
+                // The light inside the break, on every other stretch of the ring.
+                if (i % 2 != 0) continue;
+                var vein = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                Object.Destroy(vein.GetComponent<Collider>());
+                vein.name = "RiftVein" + i;
+                vein.transform.SetParent(root.transform, false);
+                vein.transform.localPosition = spot + new Vector3(0f, 0.055f, 0f);
+                vein.transform.localScale =
+                    new Vector3(band * 0.34f, 0.03f, band * 0.34f);
+                OwnedMaterial.Assign(vein, MakeUnlit(Color.Lerp(color, Color.white, 0.45f)));
+
+                // A chip of ground thrown clear of the break, on alternating sides.
+                if (i % 3 != 1) continue;
+                float side = (i % 2) == 0 ? 1f : -1f;
+                var shard = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                Object.Destroy(shard.GetComponent<Collider>());
+                shard.name = "RiftShard" + i;
+                shard.transform.SetParent(root.transform, false);
+                shard.transform.localPosition = spot + radial * (side * band * 0.62f) +
+                    new Vector3(0f, 0.04f, 0f);
+                shard.transform.localRotation = Quaternion.Euler(12f, i * 23f, -9f);
+                shard.transform.localScale =
+                    new Vector3(across * 0.30f, 0.10f + 0.06f * lift, along * 0.26f);
+                OwnedMaterial.Assign(shard, MakeUnlit(Color.Lerp(RiftStone, Color.white, 0.22f)));
             }
 
-            var seam = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            Object.Destroy(seam.GetComponent<Collider>());
-            seam.name = "RiftSeam";
-            seam.transform.SetParent(root.transform, false);
-            seam.transform.localPosition = new Vector3(0f, 0.06f, length * 0.5f);
-            seam.transform.localScale = new Vector3(width * 0.22f, 0.08f, length * 0.94f);
-            OwnedMaterial.Assign(seam, MakeUnlit(color));
+            // Two chips close in, under the fighter in the middle: the whole disc gives
+            // way, not only the rim.
+            for (int i = 0; i < 3; i++)
+            {
+                float angle = i * 2.1f + 0.6f;
+                var chip = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                Object.Destroy(chip.GetComponent<Collider>());
+                chip.name = "RiftShardInner" + i;
+                chip.transform.SetParent(root.transform, false);
+                chip.transform.localPosition = new Vector3(
+                    Mathf.Sin(angle), 0f, Mathf.Cos(angle)) * (ring * 0.34f) +
+                    new Vector3(0f, 0.04f, 0f);
+                chip.transform.localRotation = Quaternion.Euler(9f, i * 37f, -7f);
+                chip.transform.localScale =
+                    new Vector3(across * 0.34f, 0.08f, across * 0.42f);
+                OwnedMaterial.Assign(chip, MakeUnlit(Color.Lerp(RiftStone, Color.white, 0.22f)));
+            }
 
             rifts.Add(new RiftFx { Root = root.transform, T = 0f, Seam = color });
         }
@@ -442,7 +641,7 @@ namespace Arena.Gameplay
                         }
                         else
                         {
-                            Vector3 home = p.Owner.Position + Vector3.up * p.Height +
+                            Vector3 home = LaunchPoint(p.Owner, p.Ab.ProjectileShape) +
                                 p.Owner.Forward * 0.6f;
                             Vector3 toHome = home - here;
                             toHome.y = 0f;
@@ -454,6 +653,43 @@ namespace Arena.Gameplay
                             }
                             p.Velocity = toHome.normalized * p.Speed;
                         }
+                    }
+                }
+
+                // The orb's crackle: the glow breathes, the core flickers between its
+                // own tone and white, and the four bolts shoot out and snap back. All
+                // of it through position, scale and colour, so the guest draws the same
+                // thing from the snapshot it already gets.
+                if (p.Bolts != null)
+                {
+                    p.Crackle += dt;
+                    float flicker = 0.5f + 0.5f * Mathf.Sin(p.Crackle * 41f);
+                    float breath = 1.55f + 0.30f * Mathf.Sin(p.Crackle * 27f);
+                    if (p.Glow != null) p.Glow.localScale = new Vector3(breath, breath, breath);
+                    for (int b = 0; b < p.Bolts.Length; b++)
+                    {
+                        Transform bolt = p.Bolts[b];
+                        float phase = p.Crackle * 33f + b * 1.9f;
+                        float reach = 0.75f + 0.55f * (0.5f + 0.5f * Mathf.Sin(phase));
+                        bool alongZ = (b & 1) == 0;
+                        float side = (b & 2) == 0 ? 1f : -1f;
+                        float wobble = 0.10f * Mathf.Sin(phase * 0.7f);
+                        bolt.localPosition = alongZ
+                            ? new Vector3(wobble * side, 0f, side * reach * 0.45f)
+                            : new Vector3(side * reach * 0.45f, 0f, wobble * side);
+                        bolt.localScale = alongZ
+                            ? new Vector3(0.07f, 0.07f, reach)
+                            : new Vector3(reach, 0.07f, 0.07f);
+                    }
+
+                    var core = p.Go.GetComponent<OwnedMaterial>();
+                    if (core != null && core.Material != null)
+                    {
+                        Color flash = Color.Lerp(p.Tone, Color.white, 0.25f + 0.45f * flicker);
+                        if (core.Material.HasProperty(BaseColorId))
+                            core.Material.SetColor(BaseColorId, flash);
+                        if (core.Material.HasProperty(ColorId))
+                            core.Material.SetColor(ColorId, flash);
                     }
                 }
 
@@ -599,6 +835,11 @@ namespace Arena.Gameplay
                 float diameter = w.Width * (0.62f + 0.38f * pulse);
                 if (w.Root != null)
                 {
+                    // The Earthrift's ring rides its caster for the whole warning: the
+                    // circle closes on the ground the Vanguard is standing on, and the
+                    // crack opens where he took his last step.
+                    if (w.Follows != null)
+                        w.Root.position = w.Follows.Position + Vector3.up * 0.04f;
                     for (int m = 0; m < w.Markers.Count; m++)
                     {
                         Transform marker = w.Markers[m];
@@ -661,12 +902,47 @@ namespace Arena.Gameplay
             void Add(GameObject go, PrimitiveType type, Color color)
             {
                 effects.Add(new EffectSnapshot { primitive = (int)type,
-                    position = go.transform.position, scale = go.transform.localScale, color = color });
+                    position = go.transform.position, scale = go.transform.lossyScale, color = color });
             }
-            // Blades, daggers and the shield are all slabs of a different size,
-            // and the snapshot carries scale, so one primitive reproduces them all.
-            foreach (var p in projectiles) Add(p.Go, p.Ab.ProjectileShape == ProjectileShape.Orb
-                ? PrimitiveType.Sphere : PrimitiveType.Cube, p.Owner.Def.ColorLight);
+            Color Tint(GameObject go) => go.GetComponent<Renderer>().sharedMaterial
+                .GetColor(BaseColorId);
+            // Blades, daggers and the shield are all slabs of a different size, and the
+            // snapshot carries scale, so one primitive reproduces them all; the colour is
+            // read off the object rather than taken from the caster's palette, so a shield
+            // thrown in gold arrives gold.
+            //
+            // A throw that is wearing the real prop instead sends the prop's id and
+            // the slot of the hand that threw it: a shield is not a slab at any scale,
+            // and the guest has the same asset, so it draws the same object.
+            foreach (var p in projectiles)
+            {
+                if (p.Prop != null)
+                {
+                    effects.Add(new EffectSnapshot
+                    {
+                        primitive = (int)PrimitiveType.Cube,
+                        prop = p.Wire,
+                        owner = Slot(p.Owner),
+                        position = p.Go.transform.position,
+                        scale = p.Go.transform.lossyScale,
+                        color = p.Tone
+                    });
+                    continue;
+                }
+                if (p.Bolts == null)
+                {
+                    Add(p.Go, p.Ab.ProjectileShape == ProjectileShape.Orb
+                        ? PrimitiveType.Sphere : PrimitiveType.Cube, Tint(p.Go));
+                    continue;
+                }
+                // An orb ships its crackle with it: the core, the halo and the four
+                // bolts, in the order they were built, so the guest's replica slots
+                // stay matched from frame to frame.
+                Add(p.Go, PrimitiveType.Sphere, Tint(p.Go));
+                if (p.Glow != null) Add(p.Glow.gameObject, PrimitiveType.Sphere, Tint(p.Glow.gameObject));
+                foreach (var bolt in p.Bolts)
+                    if (bolt != null) Add(bolt.gameObject, PrimitiveType.Cube, Tint(bolt.gameObject));
+            }
             foreach (var v in vortices)
             {
                 if (v.Go == null) continue;
@@ -685,8 +961,19 @@ namespace Arena.Gameplay
                 // so the plates cannot be re-tilted on the guest. They still read
                 // as broken ground because they keep their scale and colour.
                 foreach (Transform part in rift.Root)
-                    Add(part.gameObject, PrimitiveType.Cube,
-                        part.name == "RiftSeam" ? rift.Seam : RiftStone);
+                {
+                    bool round = part.name.StartsWith("RiftVein") ||
+                        part.name.StartsWith("RiftSeam");
+                    Color stone = part.name.StartsWith("RiftVein")
+                            ? Color.Lerp(rift.Seam, Color.white, 0.45f)
+                        : part.name.StartsWith("RiftSeam") ? RiftVoid
+                        : part.name.StartsWith("RiftShard") ? Color.Lerp(RiftStone, Color.white, 0.22f)
+                        : RiftStone;
+                    // The seam and the vein are discs on this machine, so they are discs
+                    // on the guest's too; the plates and chips stay cubes either way.
+                    Add(part.gameObject,
+                        round ? PrimitiveType.Cylinder : PrimitiveType.Cube, stone);
+                }
             }
             foreach (var warning in warnings)
             {
@@ -706,28 +993,71 @@ namespace Arena.Gameplay
             int count = effects.Length;
             for (int i = replicatedEffects.Count - 1; i >= count; i--)
             {
-                Object.Destroy(replicatedEffects[i]); replicatedEffects.RemoveAt(i);
+                Reap(replicatedEffects[i]); replicatedEffects.RemoveAt(i);
             }
             for (int i = 0; i < count; i++)
             {
                 var effect = effects[i];
-                string name = "Replica_" + effect.primitive;
-                if (i < replicatedEffects.Count && replicatedEffects[i].name != name)
-                { Object.Destroy(replicatedEffects[i]); replicatedEffects[i] = null; }
-                GameObject go = i < replicatedEffects.Count ? replicatedEffects[i] : null;
-                if (go == null)
+                Replica slot = i < replicatedEffects.Count ? replicatedEffects[i] : null;
+                // A slot that used to be a different effect is thrown away rather than
+                // stretched into this one: a shield is not a stretched bolt.
+                if (slot != null && !slot.Matches(effect))
                 {
-                    go = GameObject.CreatePrimitive((PrimitiveType)effect.primitive);
-                    Object.Destroy(go.GetComponent<Collider>());
-                    go.name = name; go.transform.SetParent(FxRoot.transform, false);
-                    OwnedMaterial.Assign(go, MakeUnlit(effect.color));
-                    if (i < replicatedEffects.Count) replicatedEffects[i] = go;
-                    else replicatedEffects.Add(go);
+                    Reap(slot);
+                    replicatedEffects[i] = null;
+                    slot = null;
                 }
-                go.transform.position = effect.position;
-                go.transform.localScale = effect.scale;
-                go.GetComponent<Renderer>().sharedMaterial.SetColor(BaseColorId, effect.color);
+                if (slot == null)
+                {
+                    slot = Build(effect);
+                    if (slot == null) continue;
+                    if (i < replicatedEffects.Count) replicatedEffects[i] = slot;
+                    else replicatedEffects.Add(slot);
+                }
+                slot.Go.transform.position = effect.position;
+                // A prop is modelled life size and keeps its own scale on both machines;
+                // only the stand-in primitives are scaled by the snapshot.
+                if (!slot.IsProp) slot.Go.transform.localScale = effect.scale;
+                slot.Paint(effect.color);
             }
+        }
+
+        /// <summary>One guest effect slot, built from the snapshot that describes it.</summary>
+        private Replica Build(EffectSnapshot effect)
+        {
+            var slot = new Replica { Primitive = effect.primitive, Prop = effect.prop,
+                Owner = effect.owner };
+            if (slot.IsProp)
+            {
+                slot.Go = PropLibrary.Fly(effect.prop, "Replica");
+                // No prop asset on this machine: the throw is simply not drawn, which is
+                // no worse than a guest that has never seen the fighter's art.
+                if (slot.Go == null) return null;
+                slot.Go.name = "Replica_prop" + effect.prop;
+                slot.Go.transform.SetParent(FxRoot.transform, false);
+                // The same knife on the guest's screen drags the same line: the
+                // trail is dropped from the replica's own movement, so it needs
+                // nothing on the wire.
+                if (effect.prop == PropLibrary.WireDagger) RedTrail.Attach(slot.Go);
+                return slot;
+            }
+
+            var go = GameObject.CreatePrimitive((PrimitiveType)effect.primitive);
+            Object.Destroy(go.GetComponent<Collider>());
+            go.name = "Replica_" + effect.primitive;
+            go.transform.SetParent(FxRoot.transform, false);
+            // A translucent piece on the host - an orb's halo - stays translucent on the
+            // guest instead of turning into a solid ball.
+            OwnedMaterial.Assign(go, effect.color.a < 0.99f
+                ? OwnedMaterial.TransparentUnlit(effect.color)
+                : MakeUnlit(effect.color));
+            slot.Go = go;
+            return slot;
+        }
+
+        private static void Reap(Replica slot)
+        {
+            if (slot != null && slot.Go != null) Object.Destroy(slot.Go);
         }
 
         /// <summary>Eases the guest's replica effects from the previous snapshot towards the newest.</summary>
@@ -736,21 +1066,81 @@ namespace Arena.Gameplay
             if (to == null) return;
             for (int i = 0; i < replicatedEffects.Count && i < to.Length; i++)
             {
-                GameObject go = replicatedEffects[i];
-                if (go == null || to[i] == null) continue;
+                Replica slot = replicatedEffects[i];
+                if (slot == null || slot.Go == null || to[i] == null) continue;
                 Vector3 position = to[i].position;
                 Vector3 scale = to[i].scale;
                 // Only blend when the slot still holds the same kind of effect;
                 // a respawned effect simply appears at its newest transform.
                 if (previous != null && i < previous.Length && previous[i] != null &&
-                    previous[i].primitive == to[i].primitive)
+                    SameKind(previous[i], to[i]))
                 {
                     position = Vector3.Lerp(previous[i].position, position, k);
                     scale = Vector3.Lerp(previous[i].scale, scale, k);
                 }
-                go.transform.position = position;
-                go.transform.localScale = scale;
+                slot.Go.transform.position = position;
+                if (!slot.IsProp) slot.Go.transform.localScale = scale;
             }
+        }
+
+        /// <summary>Whether two snapshots describe the same object, prop or primitive.</summary>
+        private static bool SameKind(EffectSnapshot a, EffectSnapshot b)
+            => a.prop == b.prop && a.primitive == b.primitive;
+
+        // ------------------------------------------------------- the hand's props
+
+        /// <summary>
+        /// Hands the sim's roster over, in snapshot slot order. The effects a fighter
+        /// throws are attributed to its slot, so both machines empty the same hand.
+        /// </summary>
+        public void Track(IList<FighterSim> fighters) => roster = fighters;
+
+        /// <summary>
+        /// Empties the hand of every fighter whose weapon is in the air, and fills it
+        /// when the last copy of that weapon is spent - so a shield that leaves the arm
+        /// to be thrown comes back to it, and one lost against a wall does not leave the
+        /// fighter holding a phantom. The host reads the throwing copies, the guest the
+        /// replicas the host sent.
+        /// </summary>
+        public void SyncProps()
+        {
+            if (roster == null) return;
+            for (int i = 0; i < roster.Count; i++)
+            {
+                FighterSim fighter = roster[i];
+                if (fighter == null || fighter.View == null) continue;
+                fighter.View.SetPropHidden(ProjectileShape.Shield,
+                    Away(i, PropLibrary.WireShield, fighter));
+                fighter.View.SetPropHidden(ProjectileShape.Dagger,
+                    Away(i, PropLibrary.WireDagger, fighter));
+            }
+        }
+
+        /// <summary>True when a copy of `wireId` is in the air from `thrower`'s slot.</summary>
+        private bool Away(int slot, int wireId, FighterSim thrower)
+        {
+            for (int i = 0; i < projectiles.Count; i++)
+                if (projectiles[i].Prop != null && projectiles[i].Wire == wireId &&
+                    projectiles[i].Owner == thrower) return true;
+            for (int i = 0; i < replicatedEffects.Count; i++)
+            {
+                Replica slotFx = replicatedEffects[i];
+                if (slotFx != null && slotFx.Prop == wireId && slotFx.Owner == slot) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Which fighter an effect belongs to, as a snapshot slot: 0 is the local player
+        /// and 1 the fighter the LAN path mirrors. A free-for-all's extra bots are not
+        /// mirrored at all, so they share the last slot.
+        /// </summary>
+        private int Slot(FighterSim fighter)
+        {
+            if (roster == null) return 0;
+            for (int i = 0; i < roster.Count; i++)
+                if (roster[i] == fighter) return Mathf.Min(i, 1);
+            return 0;
         }
 
         /// <summary>Destroys every transient effect this spawner created.</summary>
@@ -761,7 +1151,7 @@ namespace Arena.Gameplay
             foreach (var r in rings) if (r.Go != null) Object.Destroy(r.Go);
             foreach (var r in rifts) if (r.Root != null) Object.Destroy(r.Root.gameObject);
             foreach (var w in warnings) if (w.Root != null) Object.Destroy(w.Root.gameObject);
-            foreach (var go in replicatedEffects) if (go != null) Object.Destroy(go);
+            foreach (var slot in replicatedEffects) Reap(slot);
             replicatedEffects.Clear();
             projectiles.Clear();
             vortices.Clear();
@@ -785,8 +1175,7 @@ namespace Arena.Gameplay
             public Vector3 Origin;
             /// <summary>Constant travel speed, in u/s — kept so the way home is as fast as the way out.</summary>
             public float Speed;
-            /// <summary>Height above the ground the throw travels at, so it returns to the hand.</summary>
-            public float Height;
+
             /// <summary>Metres out before it turns around; 0 for a one-way throw.</summary>
             public float TurnAt;
             /// <summary>Set once a boomerang throw has turned and is heading home.</summary>
@@ -798,6 +1187,44 @@ namespace Arena.Gameplay
             /// <summary>Degrees per second rolled about the travel axis; 0 for orbs.</summary>
             public float Spin;
             public float SpinAngle;
+            /// <summary>The orb's glow shell and its four crackle bolts; null for a blade.</summary>
+            public Transform Glow;
+            public Transform[] Bolts;
+            /// <summary>The colour the orb was thrown in, before the flicker mixes it.</summary>
+            public Color Tone;
+            public float Crackle;
+            /// <summary>The prop this throw is wearing, and the object drawn in its place (see PropLibrary).</summary>
+            public int Wire;
+            public GameObject Prop;
+        }
+
+        /// <summary>
+        /// One rebuilt guest effect. The slot remembers what it is made of - which
+        /// primitive, or which prop - so a slot that changes kind is rebuilt instead of
+        /// stretched, and so a prop in the air can be traced back to the hand that threw
+        /// it.
+        /// </summary>
+        private sealed class Replica
+        {
+            public GameObject Go;
+            public int Primitive;
+            public int Prop;
+            /// <summary>The slot of the fighter that threw it; unused for a primitive.</summary>
+            public int Owner = -1;
+            public bool IsProp => Prop != 0;
+
+            public bool Matches(EffectSnapshot effect)
+                => Prop == effect.prop && (IsProp || Primitive == effect.primitive);
+
+            /// <summary>Repaint a stand-in primitive; a prop keeps the colours it was built with.</summary>
+            public void Paint(Color color)
+            {
+                if (IsProp || Go == null) return;
+                var renderer = Go.GetComponent<Renderer>();
+                if (renderer == null || renderer.sharedMaterial == null) return;
+                if (renderer.sharedMaterial.HasProperty(BaseColorId))
+                    renderer.sharedMaterial.SetColor(BaseColorId, color);
+            }
         }
 
         /// <summary>One swirling band of a funnel: the part, its spin rate and its phase.</summary>
@@ -847,9 +1274,10 @@ namespace Arena.Gameplay
         {
             public Transform Root;
             public List<Transform> Markers;
-            /// <summary>The funnel's bands, for a gathering funnel; empty for a corridor.</summary>
+            /// <summary>The funnel's bands, for a gathering funnel; empty for a ring.</summary>
             public List<FunnelBand> Bands;
-            /// <summary>Set for a gathering funnel: it follows this fighter until it is thrown.</summary>
+            /// <summary>Set when the warning rides its caster: the gathering vortex
+            /// funnel and the Earthrift's ring both do.</summary>
             public FighterSim Follows;
             public bool Charge;
             public float T;

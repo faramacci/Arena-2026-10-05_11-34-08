@@ -160,9 +160,16 @@ def weight_part(obj, arm, bone=None, segments=None, power=4.0, blend=0.004,
     """Give one part vertex groups for `arm` and return its primary bone per vertex.
 
     `bone` pins every vertex of the part to that bone at weight 1.0, which is what
-    the wielded knives and the hanging cloth need. Otherwise the candidates are the
-    bone nearest the part's own centre and that bone's parent and children, and each
-    vertex is blended between those by inverse distance.
+    the wielded knives and the hanging cloth need. A *sequence* of names instead
+    asks for that exact set to be blended across, which is how a floor-length robe
+    is handled: it hangs around the pelvis, both thighs and both shins at once, so
+    no single bone's chain describes it, and pinning it to the pelvis would leave a
+    raised knee outside the cloth. That path also drops `ratio` and `floor` (they
+    are step functions in space, and a step in the weights is a step in the skin:
+    with them the robe tore a 7 cm gap along the line where one leg's shin stopped
+    being the nearer bone). Otherwise the candidates are the bone nearest the
+    part's own centre and that bone's parent and children, and each vertex is
+    blended between those by inverse distance.
 
     `power` sets how rigid the result is: a vertex mid-thigh is hundreds of times
     closer to its own bone than to the next candidate, so it lands at weight ~1,
@@ -171,7 +178,18 @@ def weight_part(obj, arm, bone=None, segments=None, power=4.0, blend=0.004,
     is still a visible twitch once the limb swings)."""
     segments = segments if segments is not None else deform_bones(arm)
     bones = {name: (head, tail) for name, head, tail in segments}
-    if bone is not None and bone not in bones:
+    blend_set = None
+    if bone is not None and not isinstance(bone, str):
+        blend_set = list(bone)
+        missing = [name for name in blend_set if name not in bones]
+        if missing:
+            raise KeyError("no such bone(s): %s" % ", ".join(missing))
+        bone = None
+        # Softer than the proximity path too: with power 4 the hem right beside one
+        # ankle was 98/2 between the two shins and its neighbour four centimetres
+        # away was 78/22, which stretched the cloth x2.4 when a leg lifted.
+        ratio, floor, power = float("inf"), 0.0, 2.0
+    elif bone is not None and bone not in bones:
         raise KeyError("no such bone: %s" % bone)
     groups = {name: obj.vertex_groups.get(name) or obj.vertex_groups.new(name=name)
               for name, _, _ in segments}
@@ -180,8 +198,8 @@ def weight_part(obj, arm, bone=None, segments=None, power=4.0, blend=0.004,
     for vertex in obj.data.vertices:
         centre += obj.matrix_world @ vertex.co
     centre /= total_verts
-    candidates = []
-    if bone is None:
+    candidates = list(blend_set) if blend_set is not None else []
+    if bone is None and blend_set is None:
         nearest = min((_distance_to_segment(centre, head, tail), name)
                       for name, head, tail in segments)[1]
         candidates = [name for name in chain_bones(arm, nearest) if name in bones]

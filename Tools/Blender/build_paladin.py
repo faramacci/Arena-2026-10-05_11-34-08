@@ -4,10 +4,16 @@ Run headless:
     "O:/Blender/blender.exe" --background --factory-startup --python Tools/Blender/build_paladin.py
 
 Outputs:
-    Assets/Resources/Arena/Fighters/paladin.fbx    feet at z=0, facing +Y in Blender
-    Tools/Blender/renders/paladin_*.png            five review views (four views + head)
-    Tools/Blender/renders/review.html              self-contained contact sheet
-    Tools/Blender/paladin_review.blend             the lit review scene
+    Assets/Resources/Arena/Fighters/vanguard.fbx    skinned, feet at z=0, facing +Y in Blender
+    Assets/Resources/Arena/Fighters/vanguard_shield.fbx  the lion shield on its own, for
+                                                    the arm and for the throw
+
+    Tools/Blender/renders/paladin_*.png             review views incl. a posed one
+    Tools/Blender/renders/review.html               self-contained contact sheet
+    Tools/Blender/paladin_review.blend              the lit review scene
+
+The knight is the game's Vanguard, so the FBX ships under that name; the
+script, the renders and the review scene keep calling it the paladin.
 
 Shape language: every volume is a *loft* - a stack of rounded-rectangle profiles -
 so limbs taper, armour bulges and cloth hangs instead of reading as stacked boxes.
@@ -23,6 +29,7 @@ Landmarks (metres, feet on z=0), read off the reference against a 1.95 m figure:
     shoulder 1.58  pauldron top 1.71  chin 1.68  crown 1.90  hair 1.95
 """
 
+import importlib.util
 import math
 import os
 import sys
@@ -33,7 +40,7 @@ from mathutils import Euler, Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.abspath(os.path.join(HERE, "..", ".."))
-FBX_OUT = os.path.join(PROJECT, "Assets", "Resources", "Arena", "Fighters", "paladin.fbx")
+FBX_OUT = os.path.join(PROJECT, "Assets", "Resources", "Arena", "Fighters", "vanguard.fbx")
 RENDER_DIR = os.path.join(HERE, "renders")
 BLEND_OUT = os.path.join(HERE, "paladin_review.blend")
 RES = (700, 980)
@@ -44,6 +51,48 @@ HEIGHT = 1.95          # metres to the top of the hair
 LEG_X = 0.145          # leg centreline
 ARM_X = 0.270          # arm centreline at the elbow
 PLATE = 0.014          # default armour thickness for solidified shells
+
+
+def load_rig():
+    """Import rig_kit.py, the shared armature/skinning module."""
+    path = os.path.join(HERE, "rig_kit.py")
+    spec = importlib.util.spec_from_file_location("rig_kit", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_prop_kit():
+    """Import prop_kit.py, which cuts the hand props out and exports them."""
+    path = os.path.join(HERE, "prop_kit.py")
+    spec = importlib.util.spec_from_file_location("prop_kit", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+RIG = load_rig()
+PROP_KIT = load_prop_kit()
+
+# The lion shield is thrown in the game, so it cannot stay welded into the body: it
+# ships as its own prop, with a copy in the left forearm's frame (what the arm
+# wears) and a copy in a throwable frame (what flies). See prop_kit.py.
+SHIELD = PROP_KIT.Prop(
+    prefix="shield_", bone="forearm.L", name="Shield",
+    path=os.path.join(PROJECT, "Assets", "Resources", "Arena", "Fighters",
+                      "vanguard_shield.fbx"))
+PROPS = (SHIELD,)
+
+# Where the knight's joints sit, read off the same numbers the build is made from:
+# the belt at 1.16-1.26 for the pelvis, the pauldron domes at 1.45 for the
+# shoulders, the elbow cop at 1.19, the gauntlet at 0.86-0.96 for the wrist and
+# the poleyn at 0.545 for the knee. The arms drift outwards as they come down
+# (the fist sits at ARM_X + 0.065), which is why the rig takes a single arm line.
+RIG_LANDMARKS = RIG.landmarks(
+    hip_z=1.015, spine_z=1.155, chest_z=1.355, neck_z=1.600, head_z=1.680,
+    head_top=1.910, shoulder_x=0.070, shoulder_out=0.228, shoulder_z=1.448,
+    arm_x=0.262, elbow_z=1.190, wrist_z=0.940, hand_end_z=0.800, leg_x=LEG_X,
+    knee_z=0.600, ankle_z=0.150, toe_y=0.160, toe_end_y=0.250, ground=0.035)
 
 # Palette lifted from the reference: white steel, gold trim, royal blue cloth,
 # brown leather and the warm skin/hair trio.
@@ -942,7 +991,22 @@ def light_scene(scene):
     return engine
 
 
-def render_views(obj):
+# Whole-figure views first, then the places the reference puts its detail: the
+# face, the lion crests, the sword hand and the shield.
+VIEWS = (("front", 90.0, 6.0, None, None),
+         ("threequarter", 128.0, 12.0, None, None),
+         ("side", 0.0, 6.0, None, None),
+         ("back", 270.0, 6.0, None, None),
+         ("head", 100.0, 3.0, Vector((0.0, 0.0, 1.79)), 0.44),
+         ("lion", 74.0, 6.0, Vector((-0.28, 0.0, 1.62)), 0.52),
+         ("sword", 92.0, 4.0, Vector((0.40, 0.0, 0.55)), 0.72))
+
+# The same view twice, once at rest and once posed: the pair is the only proof
+# that the skin follows the bones rather than the rig being decoration.
+POSE_VIEW = (("posed", 128.0, 12.0, None, None),)
+
+
+def render_views(obj, views=None, suffix="%s"):
     os.makedirs(RENDER_DIR, exist_ok=True)
     scene = bpy.context.scene
     scene.render.resolution_x, scene.render.resolution_y = RES
@@ -965,13 +1029,7 @@ def render_views(obj):
     log("frame: z %.3f..%.3f (span %.3f), ortho %.3f" % (low, high, span,
                                                          cam_data.ortho_scale))
     focus = Vector((0.0, 0.0, (low + high) * 0.5))
-    views = (("front", 90.0, 6.0, None, None),
-             ("threequarter", 128.0, 12.0, None, None),
-             ("side", 0.0, 6.0, None, None),
-             ("back", 270.0, 6.0, None, None),
-             ("head", 100.0, 3.0, Vector((0.0, 0.0, 1.79)), 0.44),
-             ("lion", 74.0, 6.0, Vector((-0.28, 0.0, 1.62)), 0.52),
-             ("sword", 92.0, 4.0, Vector((0.40, 0.0, 0.55)), 0.72))
+    views = VIEWS if views is None else views
     shots = []
     for name, yaw, pitch, custom_focus, custom_scale in views:
         target = focus if custom_focus is None else custom_focus
@@ -983,7 +1041,7 @@ def render_views(obj):
         cam.location = target + offset
         cam.rotation_euler = (target - cam.location).normalized() \
             .to_track_quat("-Z", "Y").to_euler()
-        path = os.path.join(RENDER_DIR, "paladin_%s.png" % name)
+        path = os.path.join(RENDER_DIR, "paladin_%s.png" % (suffix % name))
         scene.render.filepath = path
         bpy.ops.render.render(write_still=True)
         log("rendered " + path)
@@ -1001,9 +1059,63 @@ def save_blend():
         log("blend save skipped (%s)" % exc)
 
 
-def main():
-    reset_scene()
-    parts = build()
+# ------------------------------------------------------------------------- rig
+
+# Parts the rig cannot place from their own position, because they hang away from
+# the bone that carries them. A sword gripped in the fist hangs to the knee, so
+# proximity would bind it to the shin; the shield is strapped to the left forearm
+# but its centre sits nearer the shoulder; the cape is attached at the collar
+# while most of its cloth is down around the hips.
+PART_BONES = (
+    ("sword_", "hand.R"), ("shield_", "forearm.L"),
+    # Cloth that reaches across the torso is blended rather than pinned, so the
+    # hem swings with the pelvis while the collar still follows the chest.
+    ("cape_", ("chest", "spine", "hips")),
+    ("tabard", ("chest", "spine", "hips")),
+    # Gold chevrons on the cuirass: same distance from the chest as from the arm
+    # bones, and they are armour trim, not part of the arm.
+    ("filigree_", "chest"),
+    # Pelvis gear: the belt sits as close to the thigh bones as to the pelvis, so
+    # proximity alone would swing it with each step.
+    ("pelvis", "hips"), ("skirt_", "hips"), ("underskirt_", "hips"),
+    ("belt", "hips"), ("buckle", "hips"), ("strap_", "hips"))
+
+
+def part_bone(name):
+    """The bone a part must ride, or the set it must blend across, or None."""
+    for prefix, bone in PART_BONES:
+        if name.startswith(prefix):
+            return bone
+    return None
+
+
+def finish_build(parts, export=True, render=True, rig=True):
+    """Join, clean, unwrap, rig, write the FBX and (optionally) render the views.
+
+    Named `finish_build` rather than `finish` because this module is where the
+    geometry helper `finish()` lives: loft/shell/dome/ball all call it, so the
+    assembly step cannot take that name here. (The mage and the assassin call their
+    equivalent `finish`, since they only import the helper.)"""
+    if not parts:
+        raise RuntimeError("nothing built yet - call build() first")
+    armature = None
+    if rig:
+        # Weight the parts before the join: each one is judged from its own centre,
+        # which is the difference between a belt buckle following the pelvis and it
+        # following the forearm.
+        armature = RIG.build_armature("Paladin_Rig", RIG_LANDMARKS)
+        # Lift the props off before anything is weighted or joined: a shield that is
+        # part of the body mesh cannot be thrown away from the body.
+        for prop in PROPS:
+            PROP_KIT.extract(parts, RIG, armature, prop, clean=clean_mesh,
+                             unwrap=unwrap, log=log)
+        segments = RIG.deform_bones(armature)
+        pinned = 0
+        for part in parts:
+            bone = part_bone(part.name)
+            pinned += 1 if bone else 0
+            RIG.weight_part(part, armature, bone=bone, segments=segments)
+        log("rig: %d parts weighted (%d placed by name)" % (len(parts), pinned))
     knight = join_parts(parts)
     clean_mesh(knight)
     unwrap(knight)
@@ -1014,9 +1126,39 @@ def main():
     log("mesh: %d triangles, %d faces, %d material slots, %.2f m tall, %.2f m wide"
         % (triangles, len(knight.data.polygons), len(knight.data.materials), height,
            width))
-    export(knight)
-    shots = render_views(knight)
+    if armature is not None:
+        RIG.bind(knight, armature)
+        primary = RIG.primary_from_groups(knight)
+        test = RIG.pose_test(knight, armature, primary)
+        for bone, (own, head, far) in sorted(test.items()):
+            log("rig %-12s own skin %.3f m, head %.3f m, far foot %.3f m"
+                % (bone, own, head, far))
+        bleed = max(max(head, far) for _, head, far in test.values())
+        weak = min(own for own, _, _ in test.values())
+        log("rig check: weakest bone moves %.3f m, worst bleed %.3f m"
+            % (weak, bleed))
+        log("rig: %d bones, %d skinned vertices"
+            % (len(armature.data.bones), len(knight.data.vertices)))
+    if export:
+        if armature is not None:
+            RIG.export_skinned(knight, armature, FBX_OUT)
+            log("exported " + FBX_OUT + " (skinned)")
+        else:
+            export(knight)
+    shots = render_views(knight) if render else []
+    if armature is not None and render:
+        RIG.showcase_pose(armature)
+        shots += render_views(knight, POSE_VIEW)
+        RIG.clear_pose(armature)
     log("shots: " + " ".join("%s=%s" % (n, p) for n, p in shots))
+    return "%s: %d triangles, %.2f m tall, %d slots, %d bones, %d views" % (
+        "Paladin", triangles, height, len(knight.data.materials),
+        0 if armature is None else len(armature.data.bones), len(shots))
+
+
+def main():
+    reset_scene()
+    log(finish_build(build()))
     save_blend()
     log("done")
 

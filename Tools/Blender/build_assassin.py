@@ -1,7 +1,7 @@
-"""Build the Night Assassin (the hooded, red-sashed knife fighter) from the sheet.
+"""Build the Assassin (the hooded, red-sashed knife fighter) from the sheet.
 
-Same shape language and helpers as the Paladin and the Storm Mage - the geometry
-kit is imported from build_paladin.py rather than copied, so a primitive change
+Same shape language and helpers as the Vanguard and the Mage - the geometry kit is
+imported from build_paladin.py rather than copied, so a primitive change
 reaches all three characters at once. What is new here is cloth and blades: the
 reference is dark leather under a torn crimson skirt, and the knives curve.
 
@@ -18,6 +18,8 @@ Headless:
 
 Outputs:
     Assets/Resources/Arena/Fighters/assassin.fbx
+    Assets/Resources/Arena/Fighters/assassin_dagger.fbx   the right-hand knife on its
+                                                          own, for the arm and the throw
     Tools/Blender/renders/assassin_*.png
     Tools/Blender/assassin_review.blend
 
@@ -51,6 +53,9 @@ RES = (700, 980)
 NAME = "Assassin"
 LEG_X = 0.130
 ARM_X = 0.234
+# How much bigger the fighting knives are than the reference sheet draws them: the
+# blades read as letter openers from the game's camera. See `dagger()`.
+DAGGER_SCALE = 1.30
 
 
 def load_kit():
@@ -79,6 +84,15 @@ loft, shell, dome, ball = KIT.loft, KIT.shell, KIT.dome, KIT.ball
 finish, place_all, clean_mesh, unwrap, log = (
     KIT.finish, KIT.place_all, KIT.clean_mesh, KIT.unwrap, KIT.log)
 RIG = load_rig()
+
+# The knife in the right fist is the one the assassin throws, so it is lifted off the
+# body and shipped as its own prop, exactly like the knight's shield. The left knife
+# stays part of the mesh: he keeps hold of that one.
+DAGGER = KIT.PROP_KIT.Prop(
+    prefix="ass_dagger_1", bone="hand.R", name="AssassinDagger",
+    path=os.path.join(PROJECT, "Assets", "Resources", "Arena", "Fighters",
+                      "assassin_dagger.fbx"))
+PROPS = (DAGGER,)
 
 # Where the skeleton's joints sit in this character, read off the same landmarks
 # the stages are built from.
@@ -185,7 +199,14 @@ def dagger(name, parts=None):
 
     The reference's blades sweep and carry a hooked barb on the back edge, so the
     blade stations carry a growing `dx` - `loft`'s per-station offset bends the
-    blade outward without a curve modifier."""
+    blade outward without a curve modifier.
+
+    The pair of knives read as too small on screen - in the fist and in the air - so
+    the finished assembly is scaled about the grip, which is the origin it is built
+    from. That keeps the knife in the hand and the hand's own reach unchanged while
+    the blade grows; it covers all three copies at once, because the prop_kit cuts
+    the right-hand knife out of this same geometry. DAGGER_SCALE is deliberately
+    small: this is a bigger knife, not a short sword."""
     out = []
     out.append(ball(name + "_pommel", 0.024, "steel", (0.0, 0.0, 0.088),
                     parts=parts))
@@ -211,6 +232,9 @@ def dagger(name, parts=None):
                          {"z": 0.024, "w": 0.013, "d": 0.006, "r": 0.002}],
                         "steel", sides=3, bevel=0.002, parts=parts,
                         loc=(-0.030, 0.006, zz), rot=(0.0, 0.0, 30.0)))
+    for obj in out:
+        for vertex in obj.data.vertices:
+            vertex.co = vertex.co * DAGGER_SCALE
     return out
 
 
@@ -796,6 +820,10 @@ def finish(export=True, render=True, rig=True):
         # which is the difference between a belt buckle following the pelvis and it
         # following the forearm.
         armature = RIG.build_armature(NAME + "_Rig", RIG_LANDMARKS)
+        # Lift the throwing knife off before anything is weighted or joined.
+        for prop in PROPS:
+            KIT.PROP_KIT.extract(PARTS, RIG, armature, prop, clean=clean_mesh,
+                                 unwrap=unwrap, log=log)
         segments = RIG.deform_bones(armature)
         pinned = 0
         for part in PARTS:

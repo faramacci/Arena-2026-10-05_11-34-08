@@ -177,18 +177,24 @@ namespace Arena.Tests
             {
                 { "Pointer centering, four directions, analog strength and ownership", Joystick },
                 { "Camera mapping preserves analog magnitude and screen up", CameraInput },
+                { "Zoom keeps the player centred and the spawn standoff in frame", CameraZoom },
+                { "The health bar clears the fighter's head on screen", NameplateClearance },
                 { "30/60/120 FPS produce identical state", FrameRates },
                 { "Catch-up work is bounded and backlog is retained", CatchUp },
                 { "Half stick produces half acceleration", AnalogAcceleration },
                 { "Shield Throw flies out, lands once each way and comes home", ShieldThrow },
                 { "Dagger Throw outruns an orb and is spent on its hit", DaggerThrow },
+                { "The assassin's knives drag a shorter red line than the dash", KnifeTrail },
                 { "Shadowstep trades the ice for grip and speed for three seconds", Shadowstep },
+                { "A cast with no target left is refused without spending the slot", NoTargetCast },
+                { "Guest moves with the grip buff the host cast, not a constant", HasteReplication },
                 { "Blade Wave throws a fan that charges each fighter once", BladeWave },
                 { "Orb sweeps moving target and respects invulnerability", Orb },
                 { "Orb cannot hit a target beyond the wall", OrbWall },
                 { "Blink teleport does not become a swept attack", Blink },
-                { "Earthrift corridor hit respects length, width and cooldown", Area },
-                { "Frost Aegis soaks damage, replicates and expires", Aegis },
+                { "Earthrift rings its caster: radius gates the hit, never the Vanguard", Area },
+                { "Shield soaks damage, replicates and expires", Aegis },
+                { "Shield reads gold and flashes when it soaks", AegisFx },
                 { "Vortex pulls and bursts", Vortex },
                 { "Overlapping fighters and bot stay finite", Overlap },
                 { "Reload validation safely recreates property block", Reload },
@@ -201,10 +207,16 @@ namespace Arena.Tests
                 { "LAN rejects invalid addresses and oversized frames", LanValidation },
                 { "LAN timeout and cancel release listener for reconnect", LanTimeout },
                 { "Mode tiles + fighter picker drive the LAN match and disconnect recovery", LanMenuFlow },
+                { "The LAN picker stays tappable on every phone aspect", LanPickerFits },
+                { "A joining phone finds its host over the hotspot without an address", LanDiscoveryFindsHost },
+                { "A failed join says why, and a waiting host can cancel", LanRetry },
+                { "A guest joins the host the hotspot offered it, with nothing typed", LanAutoJoin },
                 { "Guest view eases between host snapshots", SnapshotSmoothing },
                 { "Landscape-only orientation for rotation-locked phones", Orientation },
                 { "Countdown restart and result are immune to stale hide timers", CountdownLifecycle },
                 { "Procedural materials are destroyed with their owners", Materials },
+                { "Rigged fighter models load, stand, shade and pose", FighterModels },
+                { "Thrown weapons are the fighter's own shield and knife", Props },
                 { "Perimeter wall runs hug their edge instead of crossing the sand", Perimeter },
                 { "Fighters stay on the sand instead of reaching the seating", ArenaReach }
             };
@@ -287,7 +299,7 @@ namespace Arena.Tests
                 return view;
             }
             var a = GameConfig.Get(id);
-            var b = GameConfig.Storm;
+            var b = GameConfig.Mage;
             var setups = new List<MatchSim.Setup>
             {
                 new MatchSim.Setup { Def = a, View = View(a, Vector3.zero), IsBot = false },
@@ -343,6 +355,100 @@ namespace Arena.Tests
             stick.OnDrag(Event(1, positions[1]));
             go.SetActive(false);
             Check(!stick.IsDragging && stick.Value == Vector2.zero, "Disabled stick retained input");
+        }
+
+        /// <summary>
+        /// What the orthographic zoom costs, asserted rather than described. The rig
+        /// takes its size from <see cref="GameConfig.CameraOrthoSize"/> and keeps the
+        /// player in the middle of the screen, and the two bounds the size is chosen
+        /// against are measured here rather than trusted:
+        /// - the ground the window looks over has to reach the longest line spell in
+        ///   the roster, or that telegraph cannot be read and dodged;
+        /// - on the widest phone aspect the game is played at (20:9), the foe at its
+        ///   20u spawn standoff has to still be inside the frame.
+        /// Coming closer than that costs one of them, which is what makes 9.5 a
+        /// boundary and not a preference.
+        /// </summary>
+        private static void CameraZoom()
+        {
+            var rigGo = Own(new GameObject("RegressionZoomRig", typeof(Camera)));
+            var rig = rigGo.AddComponent<MobaCameraRig>();
+            var cam = rigGo.GetComponent<Camera>();
+            Near(cam.orthographicSize, GameConfig.CameraOrthoSize);
+            Check(cam.orthographic, "The rig is not orthographic");
+
+            var local = Own(new GameObject("RegressionZoomLocal"));
+            local.transform.position = new Vector3(-10f, 0f, 0f);
+            rig.SetTarget(local.transform);
+            cam.aspect = 20f / 9f;      // a phone held in landscape
+
+            Vector3 mine = cam.WorldToViewportPoint(local.transform.position + Vector3.up * 0.95f);
+            Check(Mathf.Abs(mine.x - 0.5f) < 0.01f && Mathf.Abs(mine.y - 0.5f) < 0.05f,
+                "The rig does not centre the player: " + mine.x.ToString("0.00") + "," +
+                mine.y.ToString("0.00"));
+
+            // A metre forward is cos(pitch) up the screen, so the top edge of the
+            // window is size/cos(pitch) metres of ground ahead of the player.
+            float reach = GameConfig.CameraOrthoSize /
+                Mathf.Cos(GameConfig.CameraPitch * Mathf.Deg2Rad);
+            float longest = 0f;
+            string name = "";
+            foreach (var id in new[] { CharacterId.Vanguard, CharacterId.Mage, CharacterId.Assassin })
+            {
+                var character = GameConfig.Get(id);
+                for (int slot = 0; slot < character.Abilities.Length; slot++)
+                {
+                    var ab = character.Get((AbilitySlot)slot);
+                    float span = Mathf.Max(ab.Range, ab.ProjectileRange);
+                    if (span <= longest) continue;
+                    longest = span;
+                    name = character.DisplayName + "/" + ab.DisplayName;
+                }
+            }
+            Check(reach >= longest, "The camera looks " + reach.ToString("0.0") +
+                "u ahead, less than " + longest.ToString("0.0") + "u of " + name);
+
+            Vector3 foe = cam.WorldToViewportPoint(new Vector3(10f, 0.95f, 0f));
+            Check(foe.x > 0.5f && foe.x < 0.99f && foe.y > 0f && foe.y < 1f,
+                "The foe at its spawn is off screen with the zoomed camera: viewport " +
+                foe.x.ToString("0.00") + "," + foe.y.ToString("0.00"));
+        }
+
+        /// <summary>
+        /// The nameplate turns to face the camera, so its local up is the screen's up
+        /// and its height is world-height times cos(pitch) - which is why a plate that
+        /// looks comfortably above a 1.9 m figure in world units can still sit on the
+        /// head. The bar's bottom is read from the built hierarchy (the real rect, not a
+        /// second copy of the constant) and compared with the model's own crown in
+        /// screen units, so a plate that starts covering the head again fails here.
+        /// </summary>
+        private static void NameplateClearance()
+        {
+            float up = Mathf.Cos(GameConfig.CameraPitch * Mathf.Deg2Rad);
+            foreach (var id in new[] { CharacterId.Vanguard, CharacterId.Mage, CharacterId.Assassin })
+            {
+                var host = Own(new GameObject("RegressionPlateHost"));
+                var view = CharacterView.Create(GameConfig.Get(id), Vector3.zero, host.transform);
+                Own(view.gameObject);
+
+                var plate = view.transform.Find("Nameplate");
+                Check(plate != null, id + ": the view built no nameplate");
+                var bar = plate.Find("NameplateCanvas/HpBar");
+                Check(bar != null, id + ": the nameplate has no health bar");
+
+                // Identity rotation between frames, so the bar's own local offset from
+                // the anchor is its drop; that offset is the screen's, not just Y.
+                float drop = -plate.InverseTransformPoint(bar.position).y;
+                float barScreen = plate.localPosition.y * up - drop;
+                float crownScreen = view.Model.RestBounds.max.y * up;
+                Check(barScreen - crownScreen > 0.20f,
+                    id + ": the health bar's bottom is only " +
+                    (barScreen - crownScreen).ToString("0.00") +
+                    " m above the crown on screen (plate anchor y=" +
+                    plate.localPosition.y.ToString("0.00") + ", drop " +
+                    drop.ToString("0.00") + ", crown y=" +
+                    view.Model.RestBounds.max.y.ToString("0.00") + ")");
+            }
         }
 
         private static void CameraInput()
@@ -462,13 +568,225 @@ namespace Arena.Tests
         }
 
         /// <summary>
+        /// The assassin's knives drag the red line the Shadowstep dash leaves on the
+        /// sand, cut to knife size: the thrown dagger drops dashes behind it, the
+        /// guest's replica of that knife drags the same line (the trail is dropped
+        /// from the replica's own movement, so nothing rides the wire), his wave of
+        /// blades shares the one line, and the orb and the aegis drag nothing. Every
+        /// measure of the knife line is taken from the dash line's own constants
+        /// rather than restated - the same width and thickness, the same crimson - and
+        /// its shortness is pinned twice over: the marks and their life are smaller
+        /// than the dash line's, and the streak those two numbers add up to (speed x
+        /// life) is shorter on screen too. The line is also checked to be a line: the
+        /// marks of one frame's flight have to join up rather than leave a dotted
+        /// trail behind the fastest thing in the arena.
+        /// </summary>
+        private static void KnifeTrail()
+        {
+            // The dash line's numbers, read from the code that draws it.
+            float dashSpan = StaticConst(typeof(CharacterView), "TrailMaxSpan");
+            float dashWidth = StaticConst(typeof(CharacterView), "TrailWidth");
+            float dashFade = StaticConst(typeof(CharacterView), "TrailFade");
+            var dashRed = (Color)typeof(CharacterView)
+                .GetField("ShadowStepRed", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+            Check(dashRed == RedTrail.LineRed, "The knife line is a different red from the dash line");
+
+            var s = Match(CharacterId.Assassin);
+            Check(s.Local.Def.Get(AbilitySlot.Primary).Id == "dagger_throw",
+                "The assassin's first spell is not Dagger Throw");
+            s.Local.Position = Vector3.zero;
+            s.Local.Forward = Vector3.right;
+            s.Foe.Position = new Vector3(60f, 0f, 0f);
+            s.Foe.Velocity = Vector3.zero;
+            Check(s.Cast(s.Local, (int)AbilitySlot.Primary), "Dagger rejected");
+
+            var knife = FirstProjectile(s);
+            Check(knife != null, "The dagger never left the hand");
+            var trail = knife.GetComponent<RedTrail>();
+            Check(trail != null, "The thrown knife carries no trail");
+
+            // Fly it. The sim moves the knife and the trail is dropped from that
+            // movement; the components are stepped by hand because this harness
+            // advances the match, not the frame loop.
+            var root = EffectRoot(s);
+            for (int i = 0; i < 8 && knife != null; i++)
+            {
+                s.Foe.Position = new Vector3(60f, 0f, 0f);
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+                if (knife != null) Invoke(trail, "LateUpdate");
+            }
+
+            var line = root != null ? root.transform.Find("RedTrailLine") : null;
+            Check(line != null, "The knife left no red line behind it");
+            int dashes = 0;
+            float longest = 0f;
+            foreach (Transform dash in line)
+            {
+                if (!dash.gameObject.activeSelf) continue;
+                dashes++;
+                longest = Mathf.Max(longest, dash.localScale.z);
+            }
+            Check(dashes > 0, "The knife's line exists but drew nothing");
+            Check(longest < dashSpan, "A knife dash is " + longest.ToString("0.00") +
+                "m long, no shorter than the dash line's " + dashSpan.ToString("0.00") + "m");
+            // The same ink, not a thinner copy: a knife mark is cut from the dash
+            // line's own width and thickness.
+            Check(Mathf.Approximately((float)StaticConst(line.gameObject, "Width"), dashWidth),
+                "A knife mark is " + ((float)StaticConst(line.gameObject, "Width")).ToString("0.00") +
+                "m wide, not the dash line's " + dashWidth.ToString("0.00") + "m");
+            float dashThickness = StaticConst(typeof(CharacterView), "TrailThickness");
+            Check(Mathf.Approximately(
+                    (float)StaticConst(line.gameObject, "Thickness"), dashThickness),
+                "A knife mark is a different thickness from the dash line's " +
+                dashThickness.ToString("0.00") + "m");
+            float knifeFade = (float)StaticConst(line.gameObject, "Fade");
+            Check(knifeFade < dashFade,
+                "A knife dash outlives the dash line's " + dashFade.ToString("0.00") + "s");
+            // Shorter has to hold on screen and not only in the constants: what the
+            // player sees is the metres the mark's owner covers before it fades, and
+            // the knife is twice as fast as the dash, so a shorter life is what keeps
+            // its streak the shorter of the two.
+            float knifeStreak = GameConfig.Assassin.Get(AbilitySlot.Primary).ProjectileSpeed *
+                knifeFade;
+            float dashStreak = GameConfig.Assassin.Get(AbilitySlot.Secondary).BuffSpeed * dashFade;
+            Check(knifeStreak < dashStreak, "The knife's line runs " +
+                knifeStreak.ToString("0.0") + "m against the dash line's " +
+                dashStreak.ToString("0.0") + "m, so it is not the shorter of the two");
+
+            // And it has to be a line, not a dotted trail: a knife covers 0.6 m
+            // between frames at 36 m/s, so the segment it crossed in one frame is
+            // filled with as many marks as it takes rather than left half bare.
+            var marks = new List<Vector2>();
+            foreach (Transform dash in line)
+            {
+                if (!dash.gameObject.activeSelf) continue;
+                float half = dash.localScale.z * 0.5f;
+                marks.Add(new Vector2(dash.position.x - half, dash.position.x + half));
+            }
+            marks.Sort((a, b) => a.x.CompareTo(b.x));
+            float widestGap = 0f;
+            for (int i = 1; i < marks.Count; i++)
+                widestGap = Mathf.Max(widestGap, marks[i].x - marks[i - 1].y);
+            Check(widestGap <= 0.02f, "The knife's line is dotted: a " +
+                widestGap.ToString("0.00") + "m gap sits between two of its marks");
+
+            // The guest draws it too, from the replica's own movement.
+            var snapshot = JsonUtility.FromJson<MatchSnapshot>(JsonUtility.ToJson(s.CaptureSnapshot()));
+            bool carryingKnife = false;
+            foreach (var effect in snapshot.effects)
+                if (effect.prop == PropLibrary.WireDagger) carryingKnife = true;
+            Check(carryingKnife, "The host snapshot carried no dagger for the guest");
+            var guest = Match(CharacterId.Assassin);
+            guest.ApplySnapshot(snapshot);
+            var guestRoot = EffectRoot(guest);
+            Transform replica = null;
+            foreach (Transform child in guestRoot.transform)
+                if (child.name.StartsWith("Replica_prop")) replica = child;
+            Check(replica != null && replica.GetComponent<RedTrail>() != null,
+                "The guest's replica knife carries no trail");
+
+            // The wave of blades is the same knives: one shared line, reused.
+            int built = line.childCount;
+            int inTheAirAlready = Projectiles(s).Count;      // the dagger is still flying
+            var ultimate = GameConfig.Assassin.Get(AbilitySlot.Ultimate);
+            s.Local.Cooldowns[(int)AbilitySlot.Ultimate] = 0f;
+            s.Foe.Position = new Vector3(60f, 0f, 0f);
+            Check(s.Cast(s.Local, (int)AbilitySlot.Ultimate), "Blade Wave rejected");
+            Check(Projectiles(s).Count - inTheAirAlready == ultimate.FanCount,
+                "The wave threw the wrong number of blades");
+            for (int i = 0; i < 8; i++)
+            {
+                s.Foe.Position = new Vector3(60f, 0f, 0f);
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+                foreach (var blade in Projectiles(s))
+                {
+                    var go = (GameObject)AnyField(blade, "Go").GetValue(blade);
+                    var bladeTrail = go != null ? go.GetComponent<RedTrail>() : null;
+                    if (bladeTrail != null) Invoke(bladeTrail, "LateUpdate");
+                }
+            }
+            // The pool is fixed: a fan of blades fills it (lazily, one dash at a
+            // time) and a further volley reuses those dashes instead of growing the
+            // hierarchy, however many knives are thrown over a match.
+            int segments = (int)StaticConst(line.gameObject, "Segments");
+            Check(line.childCount <= segments, "The knife line grew past its own pool (" +
+                line.childCount + " of " + segments + ")");
+            Check(line.childCount >= built, "The knife line lost dashes between throws");
+            int pooled = line.childCount;
+            s.Local.Cooldowns[(int)AbilitySlot.Ultimate] = 0f;
+            Check(s.Cast(s.Local, (int)AbilitySlot.Ultimate), "A second Blade Wave was rejected");
+            for (int i = 0; i < 8; i++)
+            {
+                s.Foe.Position = new Vector3(60f, 0f, 0f);
+                s.Tick(GameConfig.FixedTimestep, Vector3.zero);
+                foreach (var blade in Projectiles(s))
+                {
+                    var go = (GameObject)AnyField(blade, "Go").GetValue(blade);
+                    var bladeTrail = go != null ? go.GetComponent<RedTrail>() : null;
+                    if (bladeTrail != null) Invoke(bladeTrail, "LateUpdate");
+                }
+            }
+            Check(line.childCount == pooled, "A second throw grew the knife line (" +
+                pooled + " -> " + line.childCount + "), so the dashes are not pooled");
+
+            // Nothing that is not a knife drags a line.
+            var mage = Match(CharacterId.Mage);
+            mage.Local.Position = Vector3.zero;
+            mage.Local.Forward = Vector3.right;
+            mage.Foe.Position = new Vector3(30f, 0f, 0f);
+            Check(mage.Cast(mage.Local, 0), "Orb rejected");
+            for (int i = 0; i < 6; i++) mage.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(NoKnifeLine(mage), "The mage's orb dragged a knife line");
+
+            var vanguard = Match(CharacterId.Vanguard);
+            vanguard.Local.Position = Vector3.zero;
+            vanguard.Local.Forward = Vector3.right;
+            vanguard.Foe.Position = new Vector3(30f, 0f, 0f);
+            Check(vanguard.Cast(vanguard.Local, 0), "Shield Throw rejected");
+            for (int i = 0; i < 6; i++) vanguard.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(NoKnifeLine(vanguard), "The thrown aegis dragged a knife line");
+        }
+
+        /// <summary>A private constant on a type, read by name.</summary>
+        private static float StaticConst(Type type, string name)
+            => (float)type.GetField(name, BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+
+        /// <summary>
+        /// The same constant, found on whichever component the line was built with -
+        /// the trail line's own type is internal to the game assembly.
+        /// </summary>
+        private static object StaticConst(GameObject host, string name)
+        {
+            foreach (var component in host.GetComponents<MonoBehaviour>())
+            {
+                var field = component.GetType().GetField(name,
+                    BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                if (field != null) return field.GetValue(null);
+            }
+            throw new Exception("No " + name + " constant on " + host.name);
+        }
+
+        private static bool NoKnifeLine(MatchSim sim)
+        {
+            var root = EffectRoot(sim);
+            return root == null || root.transform.Find("RedTrailLine") == null;
+        }
+
+        private static GameObject FirstProjectile(MatchSim sim)
+        {
+            foreach (var projectile in Projectiles(sim))
+                return (GameObject)AnyField(projectile, "Go").GetValue(projectile);
+            return null;
+        }
+
+        /// <summary>
         /// Shadowstep trades the ice for grip: for its three seconds the assassin
         /// tracks the stick and holds a speed nobody else reaches, so he stops and
         /// turns on a coin — and when the timer runs out the ice comes back.
         /// </summary>
         private static void Shadowstep()
         {
-            var plain = Match(CharacterId.Storm);
+            var plain = Match(CharacterId.Mage);
             var hasted = Match(CharacterId.Assassin);
             var ab = hasted.Local.Def.Get(AbilitySlot.Secondary);
             Check(ab.Id == "shadowstep", "The assassin's second spell is not Shadowstep");
@@ -515,6 +833,63 @@ namespace Arena.Tests
         }
 
         /// <summary>
+        /// A cast with nobody left to aim at is refused without spending the slot.
+        /// The cooldown was written before the target was looked up, so a refusal
+        /// still cost the player the spell: a match with every opponent down is the
+        /// one case the HUD's "only real casts start a bar" rule cannot cover on its
+        /// own, and the sim has to refuse it for free.
+        /// </summary>
+        private static void NoTargetCast()
+        {
+            var s = Match(CharacterId.Assassin);
+            var ab = s.Local.Def.Get(AbilitySlot.Primary);
+            Check(s.Cast(s.Local, (int)AbilitySlot.Primary), "A cast with a live target was refused");
+            Near(s.Local.Cooldowns[(int)AbilitySlot.Primary], ab.Cooldown);
+
+            for (int i = 1; i < s.Fighters.Count; i++)
+            {
+                s.Fighters[i].Health = 0f;
+                s.Fighters[i].Dead = true;
+            }
+            s.Local.Cooldowns[(int)AbilitySlot.Primary] = 0f;
+            Check(!s.Cast(s.Local, (int)AbilitySlot.Primary),
+                "A cast with no target left standing must be refused");
+            Near(s.Local.Cooldowns[(int)AbilitySlot.Primary], 0f);
+        }
+
+        /// <summary>
+        /// The grip buff's own numbers cross the wire. The shipped Shadowstep happens
+        /// to run at exactly the GameConfig defaults, so a guest that recomputed them
+        /// from those constants instead of reading the snapshot would look correct
+        /// today and drift the moment the ability is retuned. The host is therefore
+        /// handed a pair of values that match no constant, and both machines run the
+        /// same lane afterwards: a guest on the constants would move differently from
+        /// the first step of the buff.
+        /// </summary>
+        private static void HasteReplication()
+        {
+            var host = Match(CharacterId.Assassin); var guest = Match(CharacterId.Assassin);
+            var ab = host.Local.Def.Get(AbilitySlot.Secondary);
+            Check(ab.Id == "shadowstep", "The grip buff is not Shadowstep");
+            Check(host.Cast(host.Local, (int)AbilitySlot.Secondary), "Shadowstep rejected");
+
+            host.Local.HasteSpeed = GameConfig.HasteTopSpeed + 7f;
+            host.Local.HasteGrip = GameConfig.HasteGrip + 8f;
+            var state = JsonUtility.FromJson<MatchSnapshot>(JsonUtility.ToJson(host.CaptureSnapshot()));
+            guest.ApplySnapshot(state);
+            Near(guest.Local.HasteSpeed, host.Local.HasteSpeed);
+            Near(guest.Local.HasteGrip, host.Local.HasteGrip);
+
+            for (int i = 0; i < 60; i++)
+            {
+                host.Tick(GameConfig.FixedTimestep, Vector3.left);
+                guest.Tick(GameConfig.FixedTimestep, Vector3.left);
+            }
+            Near(guest.Local.Haste, host.Local.Haste);
+            Near((guest.Local.Velocity - host.Local.Velocity).magnitude, 0f, 0.001f);
+        }
+
+        /// <summary>
         /// Blade Wave is the assassin's ultimate: a whole fan of blades at once,
         /// thrown wide enough to catch a target who dodges sideways — but a
         /// fighter standing inside the fan is charged by one blade, not seven.
@@ -554,7 +929,7 @@ namespace Arena.Tests
         {
             foreach (bool immune in new[] { false, true })
             {
-                var s = Match(CharacterId.Storm);
+                var s = Match(CharacterId.Mage);
                 s.Foe.Position = new Vector3(3f,0,0);
                 s.Foe.Velocity = Vector3.left * 300f;
                 if (immune) s.Foe.Invulnerable = 0.1f;
@@ -566,14 +941,14 @@ namespace Arena.Tests
 
         private static void OrbWall()
         {
-            var s = Match(CharacterId.Storm);
+            var s = Match(CharacterId.Mage);
             s.Local.Position = new Vector3(GameConfig.PlayLimit - 0.1f, 0f, 0f);
             s.Foe.Position = new Vector3(GameConfig.PlayLimit + 0.9f, 0f, 0f);
             s.Cast(s.Local, 0);
             s.Tick(GameConfig.FixedTimestep, Vector3.zero);
             Near(s.Foe.Health, 100f - GameConfig.ZoneDamagePerSecond * GameConfig.FixedTimestep);
             // Also test an orb crossing the boundary from inside over several steps.
-            var inside = Match(CharacterId.Storm);
+            var inside = Match(CharacterId.Mage);
             inside.Local.Position = new Vector3(GameConfig.PlayLimit - 1.6f, 0, 0);
             inside.Foe.Position = new Vector3(-10f, 0, 0);
             inside.Cast(inside.Local, 0);
@@ -586,7 +961,7 @@ namespace Arena.Tests
 
         private static void Blink()
         {
-            var s = Match(CharacterId.Storm);
+            var s = Match(CharacterId.Mage);
             s.Local.Position = Vector3.zero; s.Local.Forward = Vector3.right;
             s.Foe.Position = new Vector3(3f,0,0);
             Check(s.Cast(s.Local, 1), "Blink rejected");
@@ -597,68 +972,111 @@ namespace Arena.Tests
         }
 
         /// <summary>
-        /// The Earthrift is a corridor, not a circle: a fighter standing in the
-        /// line eats the hit, while one past its end or off to the side does not.
+        /// The Earthrift is a circle drawn around its caster, not a corridor: a
+        /// fighter standing inside the radius eats the hit and is thrown *outward*
+        /// from the Vanguard in the middle of it, one who walks out of the circle
+        /// during the warning is missed, and the Vanguard is never caught by his own
+        /// ground.
         /// </summary>
         private static void Area()
         {
             var ab = GameConfig.Vanguard.Get(AbilitySlot.Ultimate);
-            Check(ab.Telegraph > 0f, "The Earthrift must telegraph its line");
+            Check(ab.Telegraph > 0f, "The Earthrift must telegraph its ring");
+            Check(ab.RiftBand > 0f && ab.RiftBand < ab.Range,
+                "The rift's broken band is " + ab.RiftBand + " wide inside a radius of " +
+                ab.Range + ", so the ground that breaks is not the ground that hits");
             int warningSteps = Mathf.CeilToInt(ab.Telegraph / GameConfig.FixedTimestep) + 10;
 
             // Nothing lands while the warning is on the ground, so a fighter in
-            // the corridor still has time to walk out of it.
+            // the circle still has time to walk out of it.
             var inside = Match();
+            inside.Local.Position = Vector3.zero;
             inside.Foe.Position = Vector3.right * (ab.Range - 0.1f);
             Check(inside.Cast(inside.Local, (int)AbilitySlot.Ultimate), "Rift cast rejected");
             inside.Tick(GameConfig.FixedTimestep, Vector3.zero);
             Near(inside.Foe.Health, 100f);
             Check(!inside.Cast(inside.Local, (int)AbilitySlot.Ultimate), "Area recast ignored cooldown");
 
-            // Stay in the line and the rift opens under you.
+            // Stay in the ring and the ground opens under you: the launch points away
+            // from the caster at the centre, and the caster is standing inside his own
+            // rift without taking a scratch from it.
+            float launch = 0f;
+            bool landed = false;
             for (int i = 0; i < warningSteps; i++)
             {
+                inside.Local.Position = Vector3.zero;
+                inside.Local.Velocity = Vector3.zero;
                 inside.Foe.Position = Vector3.right * (ab.Range - 0.1f);
                 inside.Foe.Velocity = Vector3.zero;
                 inside.Tick(GameConfig.FixedTimestep, Vector3.zero);
+                // Read the launch on the one tick that lands it: the victim is held in
+                // place by the loop, so every pass after the hit re-zeroes the knock.
+                if (inside.Foe.Health < 100f && !landed)
+                {
+                    landed = true;
+                    launch = inside.Foe.Velocity.x;
+                }
             }
             Near(inside.Foe.Health, 100f - ab.Damage);
+            Check(launch > 0f,
+                "The rift threw its victim inward (v=" + launch.ToString("0.00") +
+                ") instead of out of the circle");
+            Near(inside.Local.Health, 100f);
+            Near(inside.Local.Velocity.x, 0f);
 
-            // Step out of the corridor during the warning and it misses entirely.
+            // Step out of the circle during the warning and it misses entirely.
             var dodge = Match();
             dodge.Foe.Position = Vector3.right * (ab.Range * 0.5f);
             dodge.Cast(dodge.Local, (int)AbilitySlot.Ultimate);
             for (int i = 0; i < warningSteps; i++)
             {
-                dodge.Foe.Position = Vector3.right * (ab.Range + 4f);
+                dodge.Local.Position = Vector3.zero;
+                dodge.Local.Velocity = Vector3.zero;
+                dodge.Foe.Position = Vector3.right * (ab.Range + 2f);
                 dodge.Foe.Velocity = Vector3.zero;
                 dodge.Tick(GameConfig.FixedTimestep, Vector3.zero);
             }
             Near(dodge.Foe.Health, 100f);
 
-            // Past the end of the corridor: out of reach.
-            var past = Match();
-            past.Foe.Position = Vector3.right * (ab.Range + 2f);
-            past.Cast(past.Local, (int)AbilitySlot.Ultimate);
+            // The ring is the caster's own circle, so it follows him: cast from one
+            // side of the arena and carried to the victim, the ground still opens
+            // under whoever is standing in it when the warning runs out.
+            var carried = Match();
+            carried.Cast(carried.Local, (int)AbilitySlot.Ultimate);
             for (int i = 0; i < warningSteps; i++)
             {
-                past.Foe.Position = Vector3.right * (ab.Range + 2f);
-                past.Foe.Velocity = Vector3.zero;
-                past.Tick(GameConfig.FixedTimestep, Vector3.zero);
+                carried.Local.Position = new Vector3(8f, 0f, 0f);
+                carried.Local.Velocity = Vector3.zero;
+                carried.Foe.Position = new Vector3(8f, 0f, ab.Range - 0.2f);
+                carried.Foe.Velocity = Vector3.zero;
+                carried.Tick(GameConfig.FixedTimestep, Vector3.zero);
             }
-            Near(past.Foe.Health, 100f);
+            Near(carried.Foe.Health, 100f - ab.Damage);
 
-            // Well to the side of the corridor: also out of reach.
-            var beside = Match();
-            beside.Foe.Position = new Vector3(ab.Range * 0.5f, 0f, ab.RiftWidth + 1.5f);
-            beside.Cast(beside.Local, (int)AbilitySlot.Ultimate);
-            for (int i = 0; i < warningSteps; i++)
-            {
-                beside.Foe.Position = new Vector3(ab.Range * 0.5f, 0f, ab.RiftWidth + 1.5f);
-                beside.Foe.Velocity = Vector3.zero;
-                beside.Tick(GameConfig.FixedTimestep, Vector3.zero);
-            }
-            Near(beside.Foe.Health, 100f);
+            // The warning the player dodges is drawn on that same circle: it rides
+            // the caster while the ground cracks, and its markers stand on the rim
+            // of the radius the hit will cover - no wider, no narrower.
+            var riding = Match();
+            riding.Cast(riding.Local, (int)AbilitySlot.Ultimate);
+            riding.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            var warning = FirstWarning(riding);
+            Check(warning != null, "The Earthrift laid no ground warning");
+            Check(ReferenceEquals(AnyField(warning, "Follows").GetValue(warning), riding.Local),
+                "The Earthrift's ring does not ride the fighter in its middle");
+            riding.Local.Position = new Vector3(6f, 0f, 0f);
+            riding.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            var root = (Transform)AnyField(warning, "Root").GetValue(warning);
+            Near(Vector3.Distance(root.position, riding.Local.Position), 0f, 0.06f);
+            var markers = (List<Transform>)AnyField(warning, "Markers").GetValue(warning);
+            var rim = new List<float>();
+            foreach (var marker in markers)
+                rim.Add(new Vector2(marker.localPosition.x, marker.localPosition.z).magnitude);
+            Check(rim.Count > 0 && Mathf.Max(rim.ToArray()) >= ab.Range - 0.02f,
+                "The widest marker of the warning sits " +
+                (rim.Count > 0 ? Mathf.Max(rim.ToArray()).ToString("0.00") : "nowhere") +
+                " m out, short of the " + ab.Range + " m the rift covers");
+            Check(Mathf.Min(rim.ToArray()) < ab.Range * 0.5f,
+                "The warning marks only the rim: the disc the spell covers is not painted");
         }
 
         /// <summary>
@@ -674,11 +1092,11 @@ namespace Arena.Tests
             Near(s.Local.Shield, ab.ShieldAmount);
             Check(!s.Cast(s.Local, (int)AbilitySlot.Secondary), "Aegis recast ignored cooldown");
 
-            // A spell hit is absorbed: Storm's vortex bursts for 10 where its
+            // A spell hit is absorbed: the Mage's vortex bursts for 10 where its
             // throw ends, and health must not move while the shield holds.
             var v = Match();
             v.Cast(v.Local, (int)AbilitySlot.Secondary);
-            var vortex = GameConfig.Storm.Get(AbilitySlot.Ultimate);
+            var vortex = GameConfig.Mage.Get(AbilitySlot.Ultimate);
             v.Cast(v.Foe, (int)AbilitySlot.Ultimate);
             // The vortex is thrown down its line from the caster, so the victim
             // has to sit where the throw ends to eat the burst.
@@ -722,9 +1140,13 @@ namespace Arena.Tests
 
         private static void Vortex()
         {
-            var ab = GameConfig.Storm.Get(AbilitySlot.Ultimate);
+            var ab = GameConfig.Mage.Get(AbilitySlot.Ultimate);
             Check(ab.Telegraph > 0f, "The Vortex must telegraph its line");
-            var s = Match(CharacterId.Storm);
+            // The funnel is drawn at the pull diameter, so a smaller tornado is a
+            // smaller pull: 4.5 is what "a little smaller" meant, and it is pinned here
+            // so the balance change cannot drift back without a failing test.
+            Near(ab.HazardRadius, 4.5f);
+            var s = Match(CharacterId.Mage);
             var target = new Vector3(8f, 0f, 0f);
             s.Foe.Position = target;
 
@@ -796,7 +1218,7 @@ namespace Arena.Tests
 
         private static void Overlap()
         {
-            var s = Match(CharacterId.Storm, true); s.Foe.Position = s.Local.Position;
+            var s = Match(CharacterId.Mage, true); s.Foe.Position = s.Local.Position;
             s.Tick(GameConfig.FixedTimestep, Vector3.zero);
             Check(!float.IsNaN(s.Foe.Position.x) && !float.IsNaN(s.Foe.Velocity.x), "Overlap produced NaN");
             Check((s.Local.Position - s.Foe.Position).magnitude >= 1.29f, "Overlap unresolved");
@@ -812,7 +1234,7 @@ namespace Arena.Tests
             arena.SetShape(ZoneShape.Square);
             foreach (var owner in arena.GetComponentsInChildren<OwnedMaterial>())
                 if (!releasedMaterials.Contains(owner.Material)) releasedMaterials.Add(owner.Material);
-            var sim = Match(CharacterId.Storm);
+            var sim = Match(CharacterId.Mage);
             sim.Cast(sim.Local, 0); sim.Cast(sim.Local, 1); sim.Cast(sim.Local, 2);
             var root = EffectRoot(sim);
             foreach (var owner in root.GetComponentsInChildren<OwnedMaterial>())
@@ -820,6 +1242,334 @@ namespace Arena.Tests
             Check(releasedMaterials.Count >= 10, "Missing ownership on generated renderers");
             sim.Clear();
             Check(Resources.Load<Material>("Arena/ArenaLit") != null, "Shared material asset destroyed");
+        }
+
+        /// <summary>
+        /// The rigged FBX models are what the arena shows, so these checks are on the
+        /// artifacts the game loads, one character at a time: the primitives are gone
+        /// and the model replaced them, all 21 kit bones resolved, the figure stands
+        /// on the sand at human height instead of on its back or 100x off, every
+        /// material renders in this pipeline, and the skin actually follows the bones
+        /// when a pose is applied - a mesh bound to nothing travels 0.000 m.
+        /// </summary>
+        private static void FighterModels()
+        {
+            foreach (var id in new[] { CharacterId.Vanguard, CharacterId.Mage, CharacterId.Assassin })
+            {
+                var host = Own(new GameObject("RegressionModelHost"));
+                var view = CharacterView.Create(GameConfig.Get(id), Vector3.zero, host.transform);
+                Own(view.gameObject);
+
+                Check(view.HasModel, id + ": the view is not wearing a rigged model");
+                var model = view.Model;
+                Check(model.MissingBones.Count == 0,
+                    id + ": bones the kit requires are missing: " +
+                    string.Join(", ", model.MissingBones));
+                Check(!model.LyingDown, id + ": the model imports lying on its back");
+                Check(model.FacesForward, id + ": the model faces backwards");
+
+                var bounds = model.RestBounds;
+                Check(bounds.min.y > -0.05f && bounds.min.y < 0.25f,
+                    id + ": the model does not stand on the sand, its lowest point is y=" +
+                    bounds.min.y.ToString("0.000"));
+                Check(bounds.size.y > 1.60f && bounds.size.y < 2.40f,
+                    id + ": the model stands " + bounds.size.y.ToString("0.00") +
+                    " m tall (imported " + model.ImportedHeight.ToString("0.00") +
+                    " m, fitted x" + model.FittedScale.ToString("0.000") + ")");
+
+                foreach (var r in model.Renderers)
+                {
+                    if (r == null) continue;
+                    foreach (var m in r.sharedMaterials)
+                    {
+                        Check(m != null, id + ": an empty material slot on " + r.name);
+                        Check(m.shader != null && m.shader.name.Contains("Universal"),
+                            id + ": " + m.name + " is on " +
+                            (m.shader == null ? "no shader" : m.shader.name) +
+                            ", which this pipeline cannot render");
+                    }
+                }
+
+                float travel = model.SkinTravel();
+                Check(travel > 0.05f, id + ": the skin does not follow the bones, it moved " +
+                    travel.ToString("0.000") + " m when the skeleton was posed");
+
+                // Thrown weapons leave from these, so they have to be on the figure,
+                // off the ground, and - because they are read off the live skeleton -
+                // they have to travel when the skeleton does.
+                var nowhere = new Vector3(-999f, -999f, -999f);
+                foreach (var anchor in new[] { FighterAnchor.RightHand, FighterAnchor.LeftForearm })
+                {
+                    Vector3 point = view.Anchor(anchor, nowhere);
+                    Check(point != nowhere, id + ": no " + anchor + " anchor on the model");
+                    Check(point.y > 0.5f && point.y < 2.2f,
+                        id + ": the " + anchor + " anchor sits at y=" +
+                        point.y.ToString("0.00") + " m, which is not on the body");
+                    Check(Vector3.Distance(point, view.transform.position) < 1.5f,
+                        id + ": the " + anchor + " anchor is " +
+                        Vector3.Distance(point, view.transform.position).ToString("0.00") +
+                        " m from the fighter");
+                }
+
+                Vector3 restHand = view.Anchor(FighterAnchor.RightHand, nowhere);
+                model.Pose(1.5f, 1f, 0.9f, 0f, 0f);
+                Vector3 posedHand = view.Anchor(FighterAnchor.RightHand, nowhere);
+                model.Rest();
+                Check(Vector3.Distance(restHand, posedHand) > 0.10f,
+                    id + ": the hand anchor stays put when the arm swings, it moved " +
+                    Vector3.Distance(restHand, posedHand).ToString("0.000") + " m");
+
+                bool skinned = false, primitiveBody = false;
+                foreach (var r in view.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (r is SkinnedMeshRenderer) skinned = true;
+                    if (r.name == "Torso" || r.name == "Head") primitiveBody = true;
+                }
+                Check(skinned, id + ": no skinned mesh under the view");
+                Check(!primitiveBody, id + ": the primitive body is still built under the model");
+            }
+        }
+
+        /// <summary>
+        /// The hand props, which used to be welded into the body mesh and so could never
+        /// leave the hand. Each is its own object now: the shield rides the left forearm
+        /// and the knife the right fist, life size and actually on the figure; a throw
+        /// sends the object the fighter is carrying rather than a slab standing in for
+        /// it, empties the hand for exactly as long as a copy is in the air, gives it
+        /// back when the last copy is spent, and tells the guest which prop and which
+        /// hand so it can draw the same thing. A character with no such prop still
+        /// throws, on the primitive slab. The sizes are asserted because the props are
+        /// baked in metres in the bone's own frame: a unit mistake would be a 100x
+        /// shield, not a slightly wrong one.
+        /// </summary>
+        private static void Props()
+        {
+            var nowhere = new Vector3(-999f, -999f, -999f);
+
+            // --- what each character carries -------------------------------------
+            var vanguard = ModelView(GameConfig.Vanguard, "RegressionPropHost", Vector3.zero);
+            Check(vanguard.HasProp(ProjectileShape.Shield),
+                "The Vanguard is not wearing the shield he throws");
+            var worn = vanguard.Model.Prop(PropLibrary.WireShield);
+            Check(worn != null && worn.activeSelf, "The worn shield is not in the scene");
+            Bounds shield = Worn(worn);
+            Check(shield.size.y > 0.50f && shield.size.y < 1.10f,
+                "The worn shield stands " + shield.size.y.ToString("0.000") +
+                " m tall, which is not a shield on an arm");
+            Vector3 forearm = vanguard.Anchor(FighterAnchor.LeftForearm, nowhere);
+            Check(Vector3.Distance(shield.center, forearm) < 0.45f,
+                "The shield is " + Vector3.Distance(shield.center, forearm).ToString("0.000") +
+                " m from the forearm it is strapped to");
+
+            var assassin = ModelView(GameConfig.Assassin, "RegressionKnifeHost", Vector3.zero);
+            Check(assassin.HasProp(ProjectileShape.Dagger),
+                "The Assassin is not carrying the knife he throws");
+            Bounds knife = Worn(assassin.Model.Prop(PropLibrary.WireDagger));
+            Vector3 fist = assassin.Anchor(FighterAnchor.RightHand, nowhere);
+            Check(Vector3.Distance(knife.center, fist) < 0.45f,
+                "The knife is " + Vector3.Distance(knife.center, fist).ToString("0.000") +
+                " m from the fist it is held in");
+            float blade = Mathf.Max(knife.size.x, Mathf.Max(knife.size.y, knife.size.z));
+            float edge = Mathf.Min(knife.size.x, Mathf.Min(knife.size.y, knife.size.z));
+            Check(blade > 0.40f && blade < 0.75f,
+                "The worn knife is " + blade.ToString("0.000") + " m long");
+            Check(edge < 0.22f, "The worn knife is " + edge.ToString("0.000") +
+                " m thick, which is a brick rather than a blade");
+
+            var mage = ModelView(GameConfig.Mage, "RegressionMageHost", new Vector3(0f, 0f, 0f));
+            Check(!mage.HasProp(ProjectileShape.Shield) && !mage.HasProp(ProjectileShape.Dagger),
+                "The mage is carrying a weapon that belongs to another character");
+
+            // --- the throw ---------------------------------------------------------
+            var sim = ModelMatch(GameConfig.Vanguard, vanguard);
+            sim.Local.Position = Vector3.zero;
+            sim.Local.Forward = Vector3.right;
+            Check(sim.Cast(sim.Local, (int)AbilitySlot.Primary), "Shield Throw rejected");
+            sim.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(!worn.activeSelf,
+                "The shield is still on the arm while a copy of it is in the air");
+
+            object shot = null;
+            foreach (var p in Projectiles(sim)) shot = p;
+            Check(shot != null, "The shield never left the hand");
+            var flying = (GameObject)AnyField(shot, "Prop").GetValue(shot);
+            Check(flying != null,
+                "The throw is a placeholder slab, not the Vanguard's own shield");
+            var flyingRenderer = flying.GetComponentInChildren<Renderer>();
+            Check(flyingRenderer != null, "The thrown shield has nothing to draw");
+            Bounds air = flyingRenderer.bounds;
+            float reach = Mathf.Max(air.size.x, Mathf.Max(air.size.y, air.size.z));
+            Check(reach > 0.50f && reach < 1.10f,
+                "The flying shield is " + reach.ToString("0.000") +
+                " m across, which is not the size of the shield that left the arm");
+
+            // The wire has to say which prop and which hand, or the guest cannot draw the
+            // same object or empty the same arm.
+            var snapshot = sim.CaptureSnapshot();
+            Check(snapshot.effects.Length >= 1, "The throw was not captured for the guest");
+            Check(snapshot.effects[0].prop == PropLibrary.WireShield,
+                "The snapshot calls the shield " + snapshot.effects[0].prop);
+            Check(snapshot.effects[0].owner == 0,
+                "The snapshot put the throw in slot " + snapshot.effects[0].owner);
+
+            var guest = ModelMatch(GameConfig.Vanguard,
+                ModelView(GameConfig.Vanguard, "RegressionPropGuest", new Vector3(10f, 0f, 0f)));
+            guest.ApplySnapshot(snapshot);
+            Transform replica = null;
+            foreach (var t in EffectRoot(guest).GetComponentsInChildren<Transform>(true))
+                if (t.name == "Replica_prop" + PropLibrary.WireShield) replica = t;
+            Check(replica != null, "The guest drew a slab where the host threw a shield");
+            var replicaRenderer = replica.GetComponentInChildren<Renderer>();
+            Check(replicaRenderer != null, "The guest's shield replica has nothing to draw");
+            // The replica is the throw frame, so its length is across the throw rather
+            // than up: the size is what matters here, not which axis holds it.
+            Bounds copy = replicaRenderer.bounds;
+            float copyReach = Mathf.Max(copy.size.x, Mathf.Max(copy.size.y, copy.size.z));
+            Check(copyReach > 0.50f && copyReach < 1.10f,
+                "The guest's shield replica is " + copyReach.ToString("0.000") +
+                " m across, which is not the size of the shield that left the arm");
+            Check(!guest.Local.View.Model.Prop(PropLibrary.WireShield).activeSelf,
+                "The guest's hand did not empty with the host's");
+
+            // --- and it comes home -------------------------------------------------
+            for (int i = 0; i < 180; i++)
+            {
+                sim.Foe.Position = new Vector3(6f, 0f, 0f);
+                sim.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            }
+            Check(Projectiles(sim).Count == 0, "The thrown shield never came home");
+            Check(worn.activeSelf, "The shield did not go back onto the arm after the catch");
+
+            // --- a knife is a different hand ----------------------------------------
+            var knifeSim = ModelMatch(GameConfig.Assassin, assassin);
+            knifeSim.Local.Position = Vector3.zero;
+            knifeSim.Local.Forward = Vector3.right;
+            Check(knifeSim.Cast(knifeSim.Local, (int)AbilitySlot.Primary), "Dagger Throw rejected");
+            knifeSim.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(!assassin.Model.Prop(PropLibrary.WireDagger).activeSelf,
+                "The knife is still in the fist while a copy of it is in the air");
+
+            // The fan of blades is a prop throw too, five knives sharing one hand: the
+            // hand only fills again when the last of them is spent.
+            for (int i = 0; i < 200; i++) knifeSim.Tick(GameConfig.FixedTimestep, Vector3.zero);
+            Check(Projectiles(knifeSim).Count == 0, "A thrown knife never went away");
+            Check(assassin.Model.Prop(PropLibrary.WireDagger).activeSelf,
+                "The knife did not come back to the fist");
+        }
+
+        /// <summary>A fighter with a real rigged model, for the prop checks.</summary>
+        private static CharacterView ModelView(CharacterDef def, string name, Vector3 at)
+        {
+            var host = Own(new GameObject(name));
+            host.transform.position = at;
+            var view = CharacterView.Create(def, at, host.transform);
+            Own(view.gameObject);
+            Check(view.HasModel, def.DisplayName + ": the view is not wearing a rigged model");
+            return view;
+        }
+
+        /// <summary>A two-fighter match with the local fighter wearing a model.</summary>
+        private static MatchSim ModelMatch(CharacterDef localDef, CharacterView localView)
+        {
+            var foe = CharacterView.Create(GameConfig.Mage, new Vector3(12f, 0f, 0f),
+                Own(new GameObject("RegressionPropFoe")).transform);
+            Own(foe.gameObject);
+            var sim = new MatchSim(new List<MatchSim.Setup>
+            {
+                new MatchSim.Setup { Def = localDef, View = localView, IsBot = false },
+                new MatchSim.Setup { Def = GameConfig.Mage, View = foe, IsBot = false }
+            }, ZoneShape.Circle);
+            sims.Add(sim);
+            return sim;
+        }
+
+        /// <summary>The world bounds of a worn prop, read off the copy that is drawn.</summary>
+        private static Bounds Worn(GameObject prop)
+        {
+            Check(prop != null, "No prop to measure");
+            var renderer = prop.GetComponentInChildren<Renderer>();
+            Check(renderer != null, "The worn prop " + prop.name + " has nothing to draw");
+            return renderer.bounds;
+        }
+
+        /// <summary>
+        /// The Frost Aegis on the fighter itself: a gold dome over an ice-blue
+        /// Vanguard, crowned by studs that orbit it so the barrier reads as hardware
+        /// rather than a tinted ball, and a brighter dome for the beat after it soaks
+        /// a hit - the read that says the damage was eaten rather than taken. The
+        /// colour is read off the material the dome actually draws with; the flash is
+        /// driven from Update, so the test steps that by hand.
+        /// </summary>
+        private static void AegisFx()
+        {
+            var def = GameConfig.Vanguard;
+            float amount = def.Get(AbilitySlot.Secondary).ShieldAmount;
+            var host = Own(new GameObject("RegressionAegisHost"));
+            var view = CharacterView.Create(def, Vector3.zero, host.transform);
+            Own(view.gameObject);
+
+            // A fighter who never shields pays nothing for the effect.
+            view.SetShield(0f, amount);
+            Check(view.transform.Find("ShieldBubble") == null,
+                "The aegis was built for a fighter with no shield up");
+
+            view.SetShield(amount, amount);
+            var bubble = view.transform.Find("ShieldBubble");
+            Check(bubble != null && bubble.gameObject.activeSelf,
+                "The aegis did not appear when the shield went up");
+            var crown = bubble.Find("ShieldRing");
+            Check(crown != null && crown.childCount == 8,
+                "The aegis crown has " + (crown == null ? "no studs" : crown.childCount.ToString()) +
+                " studs, not 8");
+
+            var dome = bubble.Find("ShieldDome");
+            Check(dome != null, "The aegis has no dome");
+            var renderer = dome.GetComponent<Renderer>();
+            var material = dome.GetComponent<OwnedMaterial>().Material;
+            Check(material != null && renderer.sharedMaterial == material,
+                "The aegis dome does not draw with the material it owns");
+            Check(material.shader != null && material.shader.name.Contains("Universal"),
+                "The aegis dome is on " +
+                (material.shader == null ? "no shader" : material.shader.name));
+
+            Color gold = MaterialColor(material);
+            Check(gold.a < 1f, "The aegis dome is opaque");
+            Check(IsGold(gold), "The aegis dome is " + gold.ToString("F2") +
+                ", which is not the yellow effect it is supposed to be");
+            var stud = crown.GetChild(0).GetComponent<Renderer>();
+            var studMaterial = crown.GetChild(0).GetComponent<OwnedMaterial>().Material;
+            Check(studMaterial != null && stud.sharedMaterial == studMaterial,
+                "An aegis stud does not draw with the material it owns");
+            Check(IsGold(MaterialColor(studMaterial)), "The aegis studs are not yellow");
+
+            // A soak is the shield dropping: the next animated step flashes the dome.
+            view.SetShield(amount - 12f, amount);
+            Invoke(view, "AnimateShield");
+            Color flash = MaterialColor(material);
+            Check(flash.a > gold.a + 0.10f && flash.g > gold.g,
+                "The aegis did not flash when it soaked a hit: " + gold.ToString("F2") +
+                " stayed put");
+
+            // The crown goes with the dome, so nothing is left orbiting an empty air.
+            view.SetShield(0f, amount);
+            Check(!bubble.gameObject.activeSelf, "The aegis survived the shield expiring");
+        }
+
+        private static Color MaterialColor(Material m)
+        {
+            if (m.HasProperty("_BaseColor")) return m.GetColor("_BaseColor");
+            if (m.HasProperty("_Color")) return m.GetColor("_Color");
+            return Color.black;
+        }
+
+        /// <summary>
+        /// Yellow, as a band rather than one value: the aegis has to read warm on the
+        /// ice-blue fighter it sits over, and the lit and resting colours are the two
+        /// ends of that band.
+        /// </summary>
+        private static bool IsGold(Color c)
+        {
+            return c.r > 0.85f && c.g > 0.55f && c.g < 0.98f && c.b < 0.5f && c.b < c.g - 0.2f;
         }
 
         /// <summary>
@@ -924,7 +1674,7 @@ namespace Arena.Tests
             roster.SetBotCount(3, CharacterId.Vanguard);
             Check(roster.BotCount == 3 && roster.ParticipantCount == 4, "Bot fill wrong");
             Check(roster[1].Character == CharacterId.Vanguard, "First bot character wrong");
-            Check(roster[2].Character == CharacterId.Storm, "Bot characters must cycle");
+            Check(roster[2].Character == CharacterId.Mage, "Bot characters must cycle");
             Check(roster[3].Character == CharacterId.Assassin, "The cycle skipped a class");
             Check(LobbyRoster.CycleCharacter(CharacterId.Vanguard, 3) == CharacterId.Vanguard,
                 "Cycle did not wrap");
@@ -933,7 +1683,7 @@ namespace Arena.Tests
 
             // A human takes the lowest open seat, and the leader is safe from kicks.
             Check(roster.Open(4) && roster[4].State == SlotState.Open, "Open failed");
-            Check(roster.Join("Guest", CharacterId.Storm) == 4, "Join must take the first open slot");
+            Check(roster.Join("Guest", CharacterId.Mage) == 4, "Join must take the first open slot");
             Check(roster[4].State == SlotState.Player && roster.PlayerCount == 2, "Join state wrong");
             Check(!roster.Kick(LobbyRoster.LeaderIndex), "The leader must not be kickable");
             Check(roster.Kick(4) && roster[4].State == SlotState.Open, "Kick must free the slot");
@@ -942,7 +1692,7 @@ namespace Arena.Tests
             Check(roster.Leave(4) && roster[4].State == SlotState.Open, "Leave must free the slot");
 
             // Bots come and go without evicting the humans already seated.
-            Check(roster.AddBot(CharacterId.Storm) && roster.BotCount == 4, "AddBot wrong");
+            Check(roster.AddBot(CharacterId.Mage) && roster.BotCount == 4, "AddBot wrong");
             Check(roster.RemoveBot() && roster.BotCount == 3, "RemoveBot wrong");
             Check(roster.Close(5) && roster[5].State == SlotState.Closed, "Close wrong");
             Check(!roster.Close(LobbyRoster.LeaderIndex), "The leader slot must stay seated");
@@ -952,13 +1702,13 @@ namespace Arena.Tests
 
             // A full lobby turns players away instead of stacking them.
             var full = new LobbyRoster(4, CharacterId.Vanguard);
-            full.SetBotCount(3, CharacterId.Storm);
+            full.SetBotCount(3, CharacterId.Mage);
             Near(full.FirstOpenSlot, -1);
-            Near(full.Join("Late", CharacterId.Storm), -1);
+            Near(full.Join("Late", CharacterId.Mage), -1);
 
             // Cycling reaches every class rather than repeating one.
             var seen = new HashSet<CharacterId>();
-            for (int i = 0; i < 6; i++) seen.Add(LobbyRoster.CycleCharacter(CharacterId.Storm, i));
+            for (int i = 0; i < 6; i++) seen.Add(LobbyRoster.CycleCharacter(CharacterId.Mage, i));
             Check(seen.Count == System.Enum.GetValues(typeof(CharacterId)).Length,
                 "Character cycle never reaches every class");
         }
@@ -1004,14 +1754,14 @@ namespace Arena.Tests
 
             // Picking a fighter and starting hands over to the real match, and
             // the fighter that was picked is the one that spawns.
-            picker.transform.Find("SelectContent/CardRow/Card_Storm").GetComponent<Button>().onClick.Invoke();
-            Check(picker.Character == CharacterId.Storm, "Tapping a card did not select that fighter");
+            picker.transform.Find("SelectContent/CardRow/Card_Mage").GetComponent<Button>().onClick.Invoke();
+            Check(picker.Character == CharacterId.Mage, "Tapping a card did not select that fighter");
             picker.transform.Find("SelectContent/Actions/Action_START").GetComponent<Button>().onClick.Invoke();
             Check(Field(bootstrap, "phase").GetValue(bootstrap).ToString() == "Countdown",
                 "START did not begin the match");
             Near((float)Field(bootstrap, "timer").GetValue(bootstrap), GameConfig.CountdownSeconds, 0.01f);
             var sim = (MatchSim)Field(bootstrap, "sim").GetValue(bootstrap);
-            Check(sim != null && sim.Local.Def.Id == CharacterId.Storm,
+            Check(sim != null && sim.Local.Def.Id == CharacterId.Mage,
                 "The match did not use the fighter that was picked");
             Check(sim.Foe.Def.Id != sim.Local.Def.Id, "The opponent must be a different class");
             Check(sim.Fighters.Count == 2, "One opponent was asked for, so the match has two fighters");
@@ -1057,7 +1807,7 @@ namespace Arena.Tests
 
         private static void Snapshots()
         {
-            var host = Match(CharacterId.Storm); var guest = Match(CharacterId.Storm);
+            var host = Match(CharacterId.Mage); var guest = Match(CharacterId.Mage);
             host.Local.Health = 42f; host.Local.Forward = Vector3.back;
             host.Cast(host.Foe, 0); host.Cast(host.Local, 2);
             host.Tick(GameConfig.FixedTimestep, Vector3.left, Vector3.right);
@@ -1091,9 +1841,9 @@ namespace Arena.Tests
                 guest.Received += m => snapshot = m;
                 Action pump = () => { host.Pump(); guest.Pump(); };
                 Until(() => host.Connected && guest.Connected, pump);
-                guest.Send(new LanMessage { kind = "hello", character = CharacterId.Storm });
+                guest.Send(new LanMessage { kind = "hello", character = CharacterId.Mage });
                 Until(() => input != null, pump);
-                Check(input.character == CharacterId.Storm && input.kind == "hello", "Handshake corrupted");
+                Check(input.character == CharacterId.Mage && input.kind == "hello", "Handshake corrupted");
                 input = null;
                 guest.Send(new LanMessage { kind = "input", input = Vector3.left * 0.5f });
                 guest.Send(new LanMessage { kind = "cast", slot = 2 });
@@ -1117,6 +1867,16 @@ namespace Arena.Tests
             try { using (LanSession.Join("not-an-IP")) { } }
             catch (ArgumentException) { rejected = true; }
             Check(rejected, "Invalid address accepted");
+            // An empty or null address is refused with a message, never with a
+            // NullReferenceException from inside the socket call.
+            foreach (var blank in new[] { string.Empty, null })
+            {
+                bool refused = false;
+                try { using (LanSession.Join(blank)) { } }
+                catch (ArgumentException) { refused = true; }
+                Check(refused, "A blank address (" + (blank == null ? "null" : "empty") +
+                    ") was not refused with a message");
+            }
             using (var host = LanSession.Host(0))
             using (var raw = new TcpClient())
             {
@@ -1182,11 +1942,11 @@ namespace Arena.Tests
                 };
                 Action pump = () => { Invoke(bootstrap, "StepNetwork"); guest.Pump(); };
                 Until(() => guest.Connected && host.Connected, pump);
-                guest.Send(new LanMessage { kind = "hello", character = CharacterId.Storm });
+                guest.Send(new LanMessage { kind = "hello", character = CharacterId.Mage });
                 Until(() => (bool)Field(bootstrap, "handshake").GetValue(bootstrap), pump);
                 Until(() => welcome != null, pump);
                 var sim = (MatchSim)Field(bootstrap, "sim").GetValue(bootstrap);
-                Check(!sim.Foe.IsBot && sim.Foe.Def.Id == CharacterId.Storm, "Guest pick ignored");
+                Check(!sim.Foe.IsBot && sim.Foe.Def.Id == CharacterId.Mage, "Guest pick ignored");
                 Check(welcome.zone == ZoneShape.Square, "Welcome carried a stale zone");
                 Check(sim.Zone == ZoneShape.Square, "Host handshake ignored the zone picked while waiting");
                 var builtArena = (ArenaBuilder)Field(bootstrap, "arena").GetValue(bootstrap);
@@ -1224,7 +1984,7 @@ namespace Arena.Tests
                 Check(hello.kind == "hello" && hello.character == picker.Character,
                     "Join did not announce the local fighter");
                 remoteHost.Send(new LanMessage { kind = "welcome", hostCharacter = CharacterId.Vanguard,
-                    character = CharacterId.Storm, zone = ZoneShape.Square });
+                    character = CharacterId.Mage, zone = ZoneShape.Square });
                 Until(() => (bool)Field(bootstrap, "handshake").GetValue(bootstrap), pump);
                 var sim = (MatchSim)Field(bootstrap, "sim").GetValue(bootstrap);
                 var snapshot = sim.CaptureSnapshot();
@@ -1237,9 +1997,265 @@ namespace Arena.Tests
             }
         }
 
+        /// <summary>
+        /// The picker shares one row between the zone, the opponents and the
+        /// network box, laid out against a 1280x720 reference. Phones are not
+        /// that shape, so the row is measured where it is actually used: a
+        /// screen-space canvas sized like the phone's reference units, plus the
+        /// game's own canvas in this session. What matters for a hotspot match
+        /// is that the HOST / JOIN buttons and the address field a guest types
+        /// into are on screen and stay big enough to hit - a squeezed or
+        /// overflowed row is how "the buttons do not work" looks on a phone.
+        /// </summary>
+        private static void LanPickerFits()
+        {
+            foreach (float aspect in new[] { 16f / 9f, 18f / 9f, 20f / 9f, 4f / 3f })
+            {
+                float units = 720f * aspect;      // canvas reference units, height matched
+                var host = Own(new GameObject("RegressionPickerCanvas", typeof(RectTransform), typeof(Canvas)));
+                var canvas = host.GetComponent<Canvas>();
+                canvas.renderMode = RenderMode.WorldSpace;
+                var root = (RectTransform)host.transform;
+                root.sizeDelta = new Vector2(units, 720f);
+
+                var picker = CharacterSelectView.Build(root);
+                picker.Show(GameMode.LanJoin, CharacterId.Vanguard, ZoneShape.Circle, 1, 1);
+                Canvas.ForceUpdateCanvases();
+                LayoutRebuilder.ForceRebuildLayoutImmediate(root);
+
+                string label = aspect.ToString("0.00") + ":1";
+                Fits(root, label, "Options/LanBox/Seg/Role/Seg/Opt0", 60f, 44f);
+                Fits(root, label, "Options/LanBox/Seg/Role/Seg/Opt1", 60f, 44f);
+                Fits(root, label, "Options/LanBox/Seg/IpField", 150f, 40f);
+                Fits(root, label, "Actions/Action_START", 200f, 50f);
+                Fits(root, label, "Actions/Action_BACK", 120f, 50f);
+            }
+        }
+
+        /// <summary>
+        /// One control inside the picker, measured against the screen it is drawn
+        /// on: fully on screen, and at least the given size in canvas units.
+        /// </summary>
+        private static void Fits(RectTransform screen, string label, string path,
+            float minWidth, float minHeight)
+        {
+            var rt = (RectTransform)screen.Find("SelectBackdrop/SelectContent/" + path);
+            Check(rt != null, label + ": the picker has no " + path);
+            var corners = new Vector3[4];
+            rt.GetWorldCorners(corners);
+            float minX = float.PositiveInfinity, maxX = float.NegativeInfinity;
+            float minY = float.PositiveInfinity, maxY = float.NegativeInfinity;
+            for (int i = 0; i < 4; i++)
+            {
+                Vector3 p = screen.InverseTransformPoint(corners[i]);
+                minX = Mathf.Min(minX, p.x); maxX = Mathf.Max(maxX, p.x);
+                minY = Mathf.Min(minY, p.y); maxY = Mathf.Max(maxY, p.y);
+            }
+            Vector2 half = screen.rect.size * 0.5f;
+            Check(minX >= -half.x - 0.5f && maxX <= half.x + 0.5f &&
+                  minY >= -half.y - 0.5f && maxY <= half.y + 0.5f,
+                label + ": " + path + " runs off the screen (x " + minX.ToString("0") +
+                ".." + maxX.ToString("0") + " of " + (-half.x).ToString("0") + ".." +
+                half.x.ToString("0") + ")");
+            Check(rt.rect.width >= minWidth && rt.rect.height >= minHeight,
+                label + ": " + path + " is squeezed to " + rt.rect.width.ToString("0") + "x" +
+                rt.rect.height.ToString("0") + ", under the " + minWidth.ToString("0") + "x" +
+                minHeight.ToString("0") + " a finger needs");
+        }
+
+        /// <summary>
+        /// Discovery is what makes a hotspot match start without anyone reading
+        /// an address out loud: the host shouts its port on the broadcast
+        /// address of every network it is on, a joining phone hears it, and the
+        /// address it heard is one you can actually connect to. Junk on the port
+        /// is ignored rather than trusted.
+        /// </summary>
+        private static void LanDiscoveryFindsHost()
+        {
+            using (var host = LanSession.Host(0))
+            using (var beacon = new LanBeacon(host.ListeningPort))
+            using (var finder = new LanFinder())
+            {
+                Check(beacon.Error == null, "The host could not shout: " + beacon.Error);
+                Check(finder.Error == null, "The guest could not listen: " + finder.Error);
+
+                // The beacon's real work is a broadcast per interface; a directed
+                // datagram is the same send, aimed at something a test can check.
+                beacon.SendTo(IPAddress.Loopback);
+                Until(() => { finder.Poll(); return finder.Best != null; },
+                    () => System.Threading.Thread.Sleep(10));
+                var found = finder.Best;
+                Check(found != null, "The shouted port never arrived");
+                Check(found.Port == host.ListeningPort,
+                    "The beacon carried port " + found.Port + " instead of " + host.ListeningPort);
+                Check(found.Address == "127.0.0.1", "The beacon carried " + found.Address);
+
+                // What discovery offers is a host you can join.
+                using (var guest = LanSession.Join(found.Address, found.Port))
+                {
+                    LanMessage hello = null;
+                    host.Received += m => hello = m;
+                    Until(() => host.Connected && guest.Connected, () => { host.Pump(); guest.Pump(); });
+                    guest.Send(new LanMessage { kind = "hello", character = CharacterId.Mage });
+                    Until(() => hello != null, () => { host.Pump(); guest.Pump(); });
+                    Check(hello.character == CharacterId.Mage, "The discovered host dropped the handshake");
+                }
+            }
+
+            using (var finder = new LanFinder())
+            {
+                Check(finder.Error == null, "The guest could not listen: " + finder.Error);
+                Check(!finder.Observe(System.Text.Encoding.UTF8.GetBytes("nonsense"), IPAddress.Loopback),
+                    "A junk datagram was read as a host");
+                Check(!finder.Observe(System.Text.Encoding.UTF8.GetBytes(LanDiscovery.Token + " not-a-port"),
+                        IPAddress.Loopback),
+                    "A beacon without a usable port was read as a host");
+                Check(finder.Best == null, "Junk became a joinable host");
+            }
+        }
+
+        /// <summary>
+        /// The two ways a hotspot session used to look like a dead button: a
+        /// join that cannot reach anyone dropped the player back to the mode
+        /// tiles with a one-line notice they never saw, and a host waiting for a
+        /// guest had no way out except BACK. Both now belong to the picker the
+        /// player is standing on.
+        /// </summary>
+        private static void LanRetry()
+        {
+            var bootstrap = UnityEngine.Object.FindAnyObjectByType<GameBootstrap>();
+            Invoke(bootstrap, "ReturnToMenu");
+            var modes = (ModeSelectView)Field(bootstrap, "modes").GetValue(bootstrap);
+            var picker = (CharacterSelectView)Field(bootstrap, "signup").GetValue(bootstrap);
+            Button ButtonAt(string path) => picker.transform.Find("SelectContent/" + path).GetComponent<Button>();
+            var start = ButtonAt("Actions/Action_START");
+            var startLabel = picker.transform.Find("SelectContent/Actions/Action_START/Text")
+                .GetComponent<TMPro.TextMeshProUGUI>();
+            var status = (TMPro.TextMeshProUGUI)Field(picker, "status").GetValue(picker);
+
+            // A host that waits is offered the way out it is looking at.
+            modes.transform.Find("ModeContent/Tile_Lan").GetComponent<Button>().onClick.Invoke();
+            start.onClick.Invoke();
+            Check(Field(bootstrap, "network").GetValue(bootstrap) != null,
+                "The host wait never opened a listener");
+            Check(startLabel.text == "CANCEL",
+                "A waiting host has no way out: the button says " + startLabel.text);
+
+            // The waiting host shouts, so the other phone can find it without
+            // anyone reading an address out loud.
+            Invoke(bootstrap, "StepDiscovery");
+            var beacon = (LanBeacon)Field(bootstrap, "beacon").GetValue(bootstrap);
+            Check(beacon != null, "The waiting host never started shouting");
+            using (var finder = new LanFinder())
+            {
+                Check(finder.Error == null, "The other phone could not listen: " + finder.Error);
+                var shout = System.Diagnostics.Stopwatch.StartNew();
+                while (finder.Best == null && shout.Elapsed.TotalSeconds < 3)
+                {
+                    Invoke(bootstrap, "StepDiscovery");
+                    finder.Poll();
+                    System.Threading.Thread.Sleep(25);
+                }
+                var heard = finder.Best;
+                Check(heard != null, "Nobody heard the waiting host on the hotspot");
+                Check(heard.Port == ((LanSession)Field(bootstrap, "network").GetValue(bootstrap)).ListeningPort,
+                    "The shout carried port " + heard.Port + ", not the listening one");
+            }
+
+            start.onClick.Invoke();
+            Check(Field(bootstrap, "network").GetValue(bootstrap) == null, "Cancel left the listener running");
+            Check(modes.gameObject.activeSelf && !picker.gameObject.activeSelf,
+                "Cancel did not come back to the mode tiles");
+
+            // A join nobody can answer stays put and says so.
+            modes.transform.Find("ModeContent/Tile_Lan").GetComponent<Button>().onClick.Invoke();
+            ButtonAt("Options/LanBox/Seg/Role/Seg/Opt1").onClick.Invoke();
+            var address = (TMPro.TMP_InputField)Field(picker, "hostAddress").GetValue(picker);
+
+            // JOIN with an empty address is the one press that can never work:
+            // it must ask for the host's IP, not throw out of the button press
+            // (it used to raise a NullReferenceException and look like a crash).
+            address.text = string.Empty;
+            Field(bootstrap, "discoveredAddress").SetValue(bootstrap, null);
+            start.onClick.Invoke();
+            Check(picker.gameObject.activeSelf && !modes.gameObject.activeSelf,
+                "An empty join dropped the player out of the picker");
+            Check(status.text.ToLowerInvariant().Contains("host ip"),
+                "An empty join never asked for the host's IP address: " + status.text);
+            Check(status.color == UiFactory.Bad, "An empty join was not shown as a failure");
+            Check(start.interactable && startLabel.text == "JOIN BATTLE",
+                "An empty join left the action button unusable (" + startLabel.text + ")");
+            Check(Field(bootstrap, "network").GetValue(bootstrap) == null, "An empty join opened a session");
+
+            address.text = "not-an-address";
+            start.onClick.Invoke();
+            Check(picker.gameObject.activeSelf && !modes.gameObject.activeSelf,
+                "A failed join dropped the player out of the picker");
+            Check(status.text.Length > 0, "A failed join said nothing at all");
+            Check(status.color == UiFactory.Bad, "A failed join was not shown as a failure");
+            Check(start.interactable && startLabel.text == "JOIN BATTLE",
+                "A failed join left the action button unusable (" + startLabel.text + ")");
+            Check(Field(bootstrap, "network").GetValue(bootstrap) == null, "A failed join kept a session");
+            Invoke(bootstrap, "ReturnToMenu");
+        }
+
+        /// <summary>
+        /// The whole point of discovery, driven the way a player drives it: the
+        /// picker is opened on JOIN, a host starts shouting nearby, and the
+        /// address field fills itself. The same button a guest presses then
+        /// connects to that host and handshakes - nothing was typed.
+        /// </summary>
+        private static void LanAutoJoin()
+        {
+            var bootstrap = UnityEngine.Object.FindAnyObjectByType<GameBootstrap>();
+            Invoke(bootstrap, "ReturnToMenu");
+            var modes = (ModeSelectView)Field(bootstrap, "modes").GetValue(bootstrap);
+            var picker = (CharacterSelectView)Field(bootstrap, "signup").GetValue(bootstrap);
+            Button ButtonAt(string path) => picker.transform.Find("SelectContent/" + path).GetComponent<Button>();
+
+            using (var host = LanSession.Host())
+            using (var beacon = new LanBeacon(host.ListeningPort))
+            {
+                Check(beacon.Error == null, "The host could not shout: " + beacon.Error);
+                modes.transform.Find("ModeContent/Tile_Lan").GetComponent<Button>().onClick.Invoke();
+                ButtonAt("Options/LanBox/Seg/Role/Seg/Opt1").onClick.Invoke();
+                var address = (TMPro.TMP_InputField)Field(picker, "hostAddress").GetValue(picker);
+                Check(address.text.Length == 0, "The address field started out filled");
+
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                while (address.text.Length == 0 && clock.Elapsed.TotalSeconds < 3)
+                {
+                    beacon.Tick();
+                    Invoke(bootstrap, "StepDiscovery");
+                    System.Threading.Thread.Sleep(25);
+                }
+                Check(address.text.Length > 0,
+                    "Discovery never offered the host shouting on the hotspot");
+                var status = (TMPro.TextMeshProUGUI)Field(picker, "status").GetValue(picker);
+                Check(status.text.Contains(address.text),
+                    "The picker never said which host it found: " + status.text);
+
+                // Nothing was typed: this is the address a guest would have had
+                // to read off the other phone.
+                ButtonAt("Actions/Action_START").onClick.Invoke();
+                LanMessage hello = null;
+                host.Received += m => hello = m;
+                Action pump = () => { Invoke(bootstrap, "StepNetwork"); host.Pump(); };
+                Until(() => hello != null, pump);
+                Check(hello.kind == "hello" && hello.character == picker.Character,
+                    "The guest did not announce itself to the host discovery found");
+                host.Send(new LanMessage { kind = "welcome", hostCharacter = CharacterId.Vanguard,
+                    character = CharacterId.Mage, zone = ZoneShape.Circle });
+                Until(() => (bool)Field(bootstrap, "handshake").GetValue(bootstrap), pump);
+                Check(Field(bootstrap, "sim").GetValue(bootstrap) != null,
+                    "A discovered join never built the match");
+                Invoke(bootstrap, "ReturnToMenu");
+            }
+        }
+
         private static void SnapshotSmoothing()
         {
-            var host = Match(CharacterId.Storm); var guest = Match(CharacterId.Storm);
+            var host = Match(CharacterId.Mage); var guest = Match(CharacterId.Mage);
             host.Local.Position = new Vector3(2f, 0f, -3f);
             var first = JsonUtility.FromJson<MatchSnapshot>(JsonUtility.ToJson(host.CaptureSnapshot()));
             guest.ApplySnapshot(first);
@@ -1298,11 +2314,11 @@ namespace Arena.Tests
             Check(bootstrap != null, "Bootstrap not installed");
             var start = bootstrap.GetType().GetMethod("StartMatch", BindingFlags.Instance | BindingFlags.NonPublic);
             Invoke(bootstrap, "ReturnToMenu");
-            start.Invoke(bootstrap, new object[] { GameMode.Bot, ZoneShape.Circle, CharacterId.Vanguard, CharacterId.Storm });
+            start.Invoke(bootstrap, new object[] { GameMode.Bot, ZoneShape.Circle, CharacterId.Vanguard, CharacterId.Mage });
             Invoke(bootstrap, "ShowGo");
             Invoke(bootstrap, "ReturnToMenu");
             Near((float)Field(bootstrap, "goTimer").GetValue(bootstrap), -1f);
-            start.Invoke(bootstrap, new object[] { GameMode.Bot, ZoneShape.Square, CharacterId.Storm, CharacterId.Vanguard });
+            start.Invoke(bootstrap, new object[] { GameMode.Bot, ZoneShape.Square, CharacterId.Mage, CharacterId.Vanguard });
             Invoke(bootstrap, "HideCountdown");
             var label = (TMPro.TextMeshProUGUI)Field(bootstrap, "countdownLabel").GetValue(bootstrap);
             Check(label.gameObject.activeSelf && label.text == "3", "Stale callback hid new countdown");
